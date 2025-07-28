@@ -20,9 +20,6 @@ import (
 
 // --- Configuration & State ---
 
-// Song struct now includes FilePath to track download status.
-// If FilePath is empty, it needs to be downloaded.
-// If FilePath is not empty, it's ready to be played.
 type Song struct {
 	ID       string
 	URL      string
@@ -30,16 +27,12 @@ type Song struct {
 	FilePath string
 }
 
-// Bot struct now manages the two new loops.
 type Bot struct {
 	config       *Config
 	twitchClient *twitch.Client
-
-	queueMutex sync.Mutex
-	songQueue  []Song
-
-	// playerCmd holds the currently running ffplay process so we can kill it to skip
-	playerCmd *exec.Cmd
+	queueMutex   sync.Mutex
+	songQueue    []Song
+	playerCmd    *exec.Cmd
 }
 
 type Config struct {
@@ -52,22 +45,16 @@ type Config struct {
 
 func main() {
 	log.SetFlags(log.Ltime)
-
 	cfg, err := loadConfig("config.ini")
 	if err != nil {
 		log.Fatalf("[FATAL] Could not load config.ini: %v", err)
 	}
-
 	bot := &Bot{
 		config:    cfg,
 		songQueue: make([]Song, 0),
 	}
-
-	// Start the two main loops in the background. They will run concurrently.
 	go bot.downloaderLoop()
 	go bot.playerLoop()
-
-	// Configure and start the Twitch client
 	bot.twitchClient = twitch.NewClient(cfg.BotUsername, cfg.OAuthToken)
 	bot.twitchClient.OnPrivateMessage(bot.handleTwitchMessage)
 	bot.twitchClient.OnConnect(func() {
@@ -75,7 +62,6 @@ func main() {
 		bot.twitchClient.Join(cfg.Channel)
 		log.Printf("✅ ✅ ✅ SUCCESS: Joined channel #%s. Bot is fully operational.", cfg.Channel)
 	})
-
 	go func() {
 		log.Println("[INFO] Attempting to connect to Twitch...")
 		err := bot.twitchClient.Connect()
@@ -83,13 +69,10 @@ func main() {
 			log.Printf("❌ ❌ ❌ FAILED: Twitch connection error: %v", err)
 		}
 	}()
-
-	// Block until Ctrl+C is pressed
 	log.Println("[INFO] Bot is running. Press Ctrl+C to shut down.")
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 	<-sigChan
-
 	log.Println("[INFO] Shutting down...")
 }
 
@@ -102,7 +85,6 @@ func (b *Bot) handleTwitchMessage(message twitch.PrivateMessage) {
 	}
 	parts := strings.Fields(message.Message)
 	command := strings.ToLower(parts[0])
-
 	switch command {
 	case "!add":
 		b.handleAdd(message)
@@ -124,12 +106,10 @@ func (b *Bot) handleAdd(message twitch.PrivateMessage) {
 		return
 	}
 	query := strings.Join(parts[1:], " ")
-
 	ytPattern := regexp.MustCompile(`(https?://)?(www\.)?(youtube|youtu|youtube-nocookie)\.(com|be)/.+`)
 	if !ytPattern.MatchString(query) {
 		query = "ytsearch:" + query
 	}
-
 	go func() {
 		info, err := getYoutubeInfo(query)
 		if err != nil {
@@ -137,14 +117,11 @@ func (b *Bot) handleAdd(message twitch.PrivateMessage) {
 			b.twitchClient.Say(b.config.Channel, "Error: Could not find a video for that request.")
 			return
 		}
-
 		b.queueMutex.Lock()
 		defer b.queueMutex.Unlock()
-
-		if len(info.Entries) > 0 { // Playlist or search result
+		if len(info.Entries) > 0 {
 			if strings.HasPrefix(query, "ytsearch:") {
 				entry := info.Entries[0]
-				// Add the song with an EMPTY FilePath. The downloader will pick it up.
 				songToAdd := Song{ID: entry.ID, URL: entry.URL, Title: entry.Title, FilePath: ""}
 				b.songQueue = append(b.songQueue, songToAdd)
 				b.twitchClient.Say(b.config.Channel, fmt.Sprintf(`Song "%s" added! Position: %d`, songToAdd.Title, len(b.songQueue)))
@@ -159,7 +136,7 @@ func (b *Bot) handleAdd(message twitch.PrivateMessage) {
 				}
 				b.twitchClient.Say(b.config.Channel, fmt.Sprintf(`Playlist "%s" added with %d songs!`, info.Title, count))
 			}
-		} else { // Single video URL
+		} else {
 			songToAdd := Song{ID: info.ID, URL: info.URL, Title: info.Title, FilePath: ""}
 			b.songQueue = append(b.songQueue, songToAdd)
 			b.twitchClient.Say(b.config.Channel, fmt.Sprintf(`Song "%s" added! Position: %d`, songToAdd.Title, len(b.songQueue)))
@@ -171,20 +148,17 @@ func (b *Bot) handleShowQueue() {
 	b.queueMutex.Lock()
 	defer b.queueMutex.Unlock()
 	if len(b.songQueue) == 0 {
-		log.Println("[QUEUE] The queue is empty.")
 		b.twitchClient.Say(b.config.Channel, "The song queue is empty.")
 		return
 	}
-	log.Println("--- Current Queue ---")
+	b.twitchClient.Say(b.config.Channel, "--- Current Queue ---")
 	for i, song := range b.songQueue {
-		status := "Queued"
-		if song.FilePath != "" {
-			status = "Ready"
+		if i >= 3 {
+			b.twitchClient.Say(b.config.Channel, fmt.Sprintf("...and %d more.", len(b.songQueue)-i))
+			break
 		}
-		log.Printf("%d. %s [%s]", i+1, song.Title, status)
+		b.twitchClient.Say(b.config.Channel, fmt.Sprintf("%d. %s", i+1, song.Title))
 	}
-	log.Println("---------------------")
-	b.twitchClient.Say(b.config.Channel, fmt.Sprintf("There are %d songs in the queue. The full list is in my terminal.", len(b.songQueue)))
 }
 
 func (b *Bot) handleSkip(message twitch.PrivateMessage) {
@@ -221,14 +195,10 @@ func (b *Bot) handleFemboy(message twitch.PrivateMessage) {
 
 // --- Music & Player Logic ---
 
-// downloaderLoop continuously checks the queue for songs that need downloading.
 func (b *Bot) downloaderLoop() {
 	for {
 		var songToDownload *Song
-
-		// --- Find a song to download ---
 		b.queueMutex.Lock()
-		// We look for the first song in the queue that has not yet been downloaded.
 		for i := range b.songQueue {
 			if b.songQueue[i].FilePath == "" {
 				songToDownload = &b.songQueue[i]
@@ -236,66 +206,66 @@ func (b *Bot) downloaderLoop() {
 			}
 		}
 		b.queueMutex.Unlock()
-		// ---------------------------------
-
 		if songToDownload != nil {
 			log.Printf("[DOWNLOADER] Found song to download: \"%s\"", songToDownload.Title)
-			filename := fmt.Sprintf("%s.mp3", songToDownload.ID)
 
-			// Download the song. This is a blocking operation.
-			downloadCmd := exec.Command("yt-dlp", "-x", "--audio-format", "mp3", "-o", filename, songToDownload.URL)
+			// <<<<<<<<<<<< MODIFIED: No more re-encoding to MP3! >>>>>>>>>>>>>>>
+			// We download the best audio format directly, which is much faster and uses almost no CPU.
+			// The output template `%(id)s.%(ext)s` automatically uses the correct file extension.
+			filenameTemplate := "%(id)s.%(ext)s"
+
+			// We run the command with 'nice' to give it the lowest possible CPU priority.
+			// This guarantees it won't interfere with your games.
+			downloadCmd := exec.Command("nice", "-n", "19", "yt-dlp",
+				"-f", "bestaudio",
+				"-o", filenameTemplate,
+				songToDownload.URL)
+
 			if err := downloadCmd.Run(); err != nil {
 				log.Printf("[ERROR] Failed to download \"%s\": %v", songToDownload.Title, err)
-				// We could implement logic here to remove the failed song from the queue.
 			} else {
-				log.Printf("[DOWNLOADER] Finished download for: \"%s\"", songToDownload.Title)
-				// --- Mark the song as ready ---
+				// To get the actual filename (e.g., "videoID.opus"), we have to ask yt-dlp again.
+				// This is a very fast operation.
+				getFilenameCmd := exec.Command("yt-dlp", "--get-filename", "-f", "bestaudio", "-o", filenameTemplate, songToDownload.URL)
+				output, err := getFilenameCmd.Output()
+				if err != nil {
+					log.Printf("[ERROR] Could not determine filename for \"%s\": %v", songToDownload.Title, err)
+					continue
+				}
+				actualFilename := strings.TrimSpace(string(output))
+				log.Printf("[DOWNLOADER] Finished download for: \"%s\" -> %s", songToDownload.Title, actualFilename)
 				b.queueMutex.Lock()
-				// Find the song again in case the queue has changed and update its FilePath.
 				for i := range b.songQueue {
 					if b.songQueue[i].ID == songToDownload.ID {
-						b.songQueue[i].FilePath = filename
+						b.songQueue[i].FilePath = actualFilename
 						break
 					}
 				}
 				b.queueMutex.Unlock()
-				// ------------------------------
 			}
 		}
-		// Wait a moment before checking the queue again to avoid busy-looping.
 		time.Sleep(2 * time.Second)
 	}
 }
 
-// playerLoop continuously checks if it can play a downloaded song.
 func (b *Bot) playerLoop() {
 	for {
-		// --- Find a song to play ---
 		var songToPlay *Song
 		b.queueMutex.Lock()
-		// We only play if nothing else is playing AND the queue is not empty
-		// AND the first song in the queue is ready (has a FilePath).
 		if b.playerCmd == nil && len(b.songQueue) > 0 && b.songQueue[0].FilePath != "" {
-			// Take the song from the queue
 			songToPlay = &b.songQueue[0]
 			b.songQueue = b.songQueue[1:]
 		}
 		b.queueMutex.Unlock()
-		// ---------------------------
-
 		if songToPlay != nil {
 			log.Printf("[PLAYER] Found ready song to play: \"%s\"", songToPlay.Title)
 			b.playFile(*songToPlay)
 		}
-
-		// Wait a moment before checking again.
 		time.Sleep(1 * time.Second)
 	}
 }
 
-// playFile plays a single, already-downloaded audio file.
 func (b *Bot) playFile(song Song) {
-	// Defer the cleanup. This will run after playback finishes or is skipped.
 	defer func() {
 		log.Printf("[CLEANUP] Deleting file: %s", song.FilePath)
 		os.Remove(song.FilePath)
@@ -304,17 +274,22 @@ func (b *Bot) playFile(song Song) {
 	log.Printf("▶️ Now Playing: \"%s\"", song.Title)
 	b.twitchClient.Say(b.config.Channel, fmt.Sprintf("Now playing: %s", song.Title))
 
-	playerCmd := exec.Command("ffplay", "-nodisp", "-autoexit", song.FilePath)
+	// <<<<<<<<<<<< MODIFIED: Run ffplay with 'nice' and keep it quiet >>>>>>>>>>>>>>>
+	playerCmd := exec.Command("nice", "-n", "19", "ffplay",
+		"-nodisp",
+		"-autoexit",
+		"-loglevel", "error",
+		song.FilePath)
 
-	// Store the command so !skip can kill it.
+	playerCmd.Stdout = os.Stdout
+	playerCmd.Stderr = os.Stderr
+
 	b.queueMutex.Lock()
 	b.playerCmd = playerCmd
 	b.queueMutex.Unlock()
 
-	// This blocks until the song is over or the process is killed.
 	playerCmd.Run()
 
-	// Clear the command after it's done so the playerLoop knows it can play the next song.
 	b.queueMutex.Lock()
 	b.playerCmd = nil
 	b.queueMutex.Unlock()
