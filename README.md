@@ -30,7 +30,7 @@ You must have the following software installed and available in your system's PA
 
 1.  **Clone the repository:**
     ```bash
-    git clone https://github.com/your-username/your-repo-name.git
+    git clone https://github.com/k8o5/SongRequestBot13000.git
     cd your-repo-name
     ```
 
