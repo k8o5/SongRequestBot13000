@@ -34,13 +34,7 @@ You must have the following software installed and available in your system's PA
     cd SongRequestBot13000
     ```
 
-2.  **Create the configuration file:**
-    A `config.ini.example` file is included. Copy it to `config.ini`.
-    ```bash
-    cp config.ini.example config.ini
-    ```
-
-3.  **Edit the configuration file:**
+2.  **Edit the configuration file:**
     Open `config.ini` with a text editor and fill in your bot's details.
     ```bash
     nano config.ini
@@ -50,7 +44,7 @@ You must have the following software installed and available in your system's PA
     - `channel`: The Twitch channel you want the bot to join (e.g., `k8o5`).
     - `oauth_token`: Your bot's OAuth token. You can get one from [twitchapps.com/tmi/](https://twitchapps.com/tmi/). **Make sure to include the `oauth:` prefix.**
 
-4.  **Install Go dependencies:**
+3.  **Install Go dependencies:**
     The following command will read your `go.mod` file and install the necessary libraries.
     ```bash
     go mod tidy
