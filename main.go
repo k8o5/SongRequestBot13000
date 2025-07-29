@@ -3,12 +3,15 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"math/rand"
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -20,6 +23,8 @@ import (
 
 // --- Configuration & State ---
 
+const chipsFile = "user_chips.json"
+
 type Song struct {
 	ID       string
 	URL      string
@@ -27,12 +32,35 @@ type Song struct {
 	FilePath string
 }
 
+type Card struct {
+	Rank  string
+	Suit  string
+	Value int
+}
+
+type BlackjackGame struct {
+	PlayerHand []Card
+	DealerHand []Card
+	Deck       []Card
+	Bet        int64
+}
+
 type Bot struct {
-	config       *Config
-	twitchClient *twitch.Client
-	queueMutex   sync.Mutex
-	songQueue    []Song
-	playerCmd    *exec.Cmd
+	config            *Config
+	twitchClient      *twitch.Client
+	queueMutex        sync.Mutex
+	songQueue         []Song
+	playerCmd         *exec.Cmd
+	downloadDir       string
+	cleanupInterval   time.Duration
+	chipsMutex        sync.Mutex
+	userChips         map[string]int64 // NOTE: Key is now lowercase username
+	freeChipsMutex    sync.Mutex
+	lastFreeChips     map[string]time.Time // Key is lowercase username
+	freeChipsCooldown time.Duration
+	freeChipsAmount   int64
+	blackjackMutex    sync.Mutex
+	blackjackGames    map[string]*BlackjackGame // Key is lowercase username
 }
 
 type Config struct {
@@ -45,16 +73,39 @@ type Config struct {
 
 func main() {
 	log.SetFlags(log.Ltime)
+
+	downloadDir, err := os.MkdirTemp("", "musicbot-downloads")
+	if err != nil {
+		log.Fatalf("[FATAL] Could not create temporary download directory: %v", err)
+	}
+	defer os.RemoveAll(downloadDir)
+
 	cfg, err := loadConfig("config.ini")
 	if err != nil {
 		log.Fatalf("[FATAL] Could not load config.ini: %v", err)
 	}
+
 	bot := &Bot{
-		config:    cfg,
-		songQueue: make([]Song, 0),
+		config:            cfg,
+		songQueue:         make([]Song, 0),
+		downloadDir:       downloadDir,
+		cleanupInterval:   13 * time.Minute,
+		userChips:         make(map[string]int64),
+		lastFreeChips:     make(map[string]time.Time),
+		freeChipsCooldown: 1 * time.Hour,
+		freeChipsAmount:   500,
+		blackjackGames:    make(map[string]*BlackjackGame),
 	}
+
+	if err := bot.loadChips(); err != nil {
+		log.Printf("[WARN] Could not load user chips, starting fresh: %v", err)
+	}
+
 	go bot.downloaderLoop()
 	go bot.playerLoop()
+	go bot.cleanupLoop()
+	go bot.periodicSaveLoop()
+
 	bot.twitchClient = twitch.NewClient(cfg.BotUsername, cfg.OAuthToken)
 	bot.twitchClient.OnPrivateMessage(bot.handleTwitchMessage)
 	bot.twitchClient.OnConnect(func() {
@@ -62,6 +113,7 @@ func main() {
 		bot.twitchClient.Join(cfg.Channel)
 		log.Printf("✅ ✅ ✅ SUCCESS: Joined channel #%s. Bot is fully operational.", cfg.Channel)
 	})
+
 	go func() {
 		log.Println("[INFO] Attempting to connect to Twitch...")
 		err := bot.twitchClient.Connect()
@@ -69,11 +121,18 @@ func main() {
 			log.Printf("❌ ❌ ❌ FAILED: Twitch connection error: %v", err)
 		}
 	}()
+
 	log.Println("[INFO] Bot is running. Press Ctrl+C to shut down.")
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 	<-sigChan
+
 	log.Println("[INFO] Shutting down...")
+	if err := bot.saveChips(); err != nil {
+		log.Printf("[ERROR] Failed to save chips on shutdown: %v", err)
+	} else {
+		log.Println("[INFO] User chips saved successfully.")
+	}
 }
 
 // --- Twitch Command Handling ---
@@ -86,6 +145,7 @@ func (b *Bot) handleTwitchMessage(message twitch.PrivateMessage) {
 	parts := strings.Fields(message.Message)
 	command := strings.ToLower(parts[0])
 	switch command {
+	// Music Commands
 	case "!add":
 		b.handleAdd(message)
 	case "!queue":
@@ -94,9 +154,240 @@ func (b *Bot) handleTwitchMessage(message twitch.PrivateMessage) {
 		b.handleSkip(message)
 	case "!clear":
 		b.handleClearQueue(message)
+	// Chip/Game Commands
+	case "!bj", "!blackjack":
+		b.handleBlackjack(message)
+	case "!hit":
+		b.handleHit(message)
+	case "!stand":
+		b.handleStand(message)
+	case "!chips":
+		b.handleChips(message)
+	case "!freechips":
+		b.handleFreeChips(message)
+	case "!pay":
+		b.handlePay(message)
+	// Misc Commands
 	case "!femboy":
 		b.handleFemboy(message)
+	case "!help":
+		b.handleHelp(message)
 	}
+}
+
+// --- Game & Chip Command Handlers ---
+
+func (b *Bot) handlePay(message twitch.PrivateMessage) {
+	parts := strings.Fields(message.Message)
+	if len(parts) < 3 {
+		b.twitchClient.Say(b.config.Channel, fmt.Sprintf("%s, usage: !pay <username> <amount>", message.User.DisplayName))
+		return
+	}
+
+	payerUsername := strings.ToLower(message.User.Name)
+	payeeUsername := strings.ToLower(strings.TrimPrefix(parts[1], "@"))
+
+	if strings.EqualFold(payerUsername, payeeUsername) {
+		b.twitchClient.Say(b.config.Channel, fmt.Sprintf("%s, you can't pay yourself!", message.User.DisplayName))
+		return
+	}
+
+	amount, err := strconv.ParseInt(parts[2], 10, 64)
+	if err != nil || amount <= 0 {
+		b.twitchClient.Say(b.config.Channel, fmt.Sprintf("%s, please enter a valid positive number to pay.", message.User.DisplayName))
+		return
+	}
+
+	b.chipsMutex.Lock()
+	defer b.chipsMutex.Unlock()
+
+	payerChips := b.userChips[payerUsername]
+	if payerChips < amount {
+		b.twitchClient.Say(b.config.Channel, fmt.Sprintf("%s, you don't have enough chips to pay that amount. You have %d.", message.User.DisplayName, payerChips))
+		return
+	}
+
+	b.userChips[payerUsername] -= amount
+	b.userChips[payeeUsername] += amount
+
+	b.twitchClient.Say(b.config.Channel, fmt.Sprintf("%s paid %s %d chips!", message.User.DisplayName, payeeUsername, amount))
+}
+
+func (b *Bot) handleBlackjack(message twitch.PrivateMessage) {
+	parts := strings.Fields(message.Message)
+	if len(parts) < 2 {
+		b.twitchClient.Say(b.config.Channel, fmt.Sprintf("%s, usage: !bj <bet_amount>", message.User.DisplayName))
+		return
+	}
+	betAmount, err := strconv.ParseInt(parts[1], 10, 64)
+	if err != nil || betAmount <= 0 {
+		b.twitchClient.Say(b.config.Channel, fmt.Sprintf("%s, please enter a valid positive number to bet.", message.User.DisplayName))
+		return
+	}
+	if betAmount > 10000 {
+		b.twitchClient.Say(b.config.Channel, fmt.Sprintf("%s, the maximum bet is 10,000 chips.", message.User.DisplayName))
+		return
+	}
+
+	username := strings.ToLower(message.User.Name)
+	b.blackjackMutex.Lock()
+	if _, ok := b.blackjackGames[username]; ok {
+		b.twitchClient.Say(b.config.Channel, fmt.Sprintf("%s, you already have a game in progress. Use !hit or !stand.", message.User.DisplayName))
+		b.blackjackMutex.Unlock()
+		return
+	}
+	b.blackjackMutex.Unlock()
+
+	b.chipsMutex.Lock()
+	userChips := b.userChips[username]
+	if userChips < betAmount {
+		b.twitchClient.Say(b.config.Channel, fmt.Sprintf("%s, you don't have enough chips! You have %d.", message.User.DisplayName, userChips))
+		b.chipsMutex.Unlock()
+		return
+	}
+	b.userChips[username] -= betAmount
+	b.chipsMutex.Unlock()
+
+	deck := newDeck()
+	shuffleDeck(deck)
+	game := &BlackjackGame{PlayerHand: make([]Card, 0), DealerHand: make([]Card, 0), Deck: deck, Bet: betAmount}
+	game.PlayerHand = append(game.PlayerHand, dealCard(&game.Deck))
+	game.DealerHand = append(game.DealerHand, dealCard(&game.Deck))
+	game.PlayerHand = append(game.PlayerHand, dealCard(&game.Deck))
+	game.DealerHand = append(game.DealerHand, dealCard(&game.Deck))
+
+	b.blackjackMutex.Lock()
+	b.blackjackGames[username] = game
+	b.blackjackMutex.Unlock()
+
+	playerValue, _ := calculateHandValue(game.PlayerHand)
+	dealerValue, _ := calculateHandValue(game.DealerHand)
+	playerHandStr := handToString(game.PlayerHand, playerValue)
+	dealerHandStr := fmt.Sprintf("[%s, ?]", game.DealerHand[0].Rank+game.DealerHand[0].Suit)
+
+	if playerValue == 21 {
+		if dealerValue == 21 { // Push
+			b.endBlackjackGame(message, "Both you and the dealer have Blackjack! It's a push.", game.Bet)
+		} else { // Player Blackjack
+			payout := game.Bet + (game.Bet * 3 / 2)
+			b.endBlackjackGame(message, fmt.Sprintf("Blackjack! You win %d chips!", payout), payout)
+		}
+		return
+	}
+	b.twitchClient.Say(b.config.Channel, fmt.Sprintf("%s started a game! Your hand: %s. Dealer shows: %s. Use !hit or !stand.", message.User.DisplayName, playerHandStr, dealerHandStr))
+}
+
+func (b *Bot) handleHit(message twitch.PrivateMessage) {
+	username := strings.ToLower(message.User.Name)
+
+	b.blackjackMutex.Lock()
+	game, ok := b.blackjackGames[username]
+	if !ok {
+		b.blackjackMutex.Unlock()
+		b.twitchClient.Say(b.config.Channel, fmt.Sprintf("%s, you don't have a game in progress. Use !bj <amount> to start one.", message.User.DisplayName))
+		return
+	}
+	b.blackjackMutex.Unlock()
+
+	game.PlayerHand = append(game.PlayerHand, dealCard(&game.Deck))
+	playerValue, _ := calculateHandValue(game.PlayerHand)
+	playerHandStr := handToString(game.PlayerHand, playerValue)
+
+	if playerValue > 21 {
+		b.twitchClient.Say(b.config.Channel, fmt.Sprintf("%s busts with %s! You lose %d chips.", message.User.DisplayName, playerHandStr, game.Bet))
+		b.endBlackjackGame(message, "", 0) // End game with 0 payout
+		return
+	}
+
+	if playerValue == 21 {
+		b.twitchClient.Say(b.config.Channel, fmt.Sprintf("%s, your new hand: %s. Automatically standing.", message.User.DisplayName, playerHandStr))
+		b.handleStand(message) // Automatically stand for the player
+		return
+	}
+
+	b.twitchClient.Say(b.config.Channel, fmt.Sprintf("%s, your new hand: %s. !hit or !stand?", message.User.DisplayName, playerHandStr))
+}
+
+func (b *Bot) handleStand(message twitch.PrivateMessage) {
+	username := strings.ToLower(message.User.Name)
+
+	b.blackjackMutex.Lock()
+	game, ok := b.blackjackGames[username]
+	if !ok {
+		b.blackjackMutex.Unlock()
+		b.twitchClient.Say(b.config.Channel, fmt.Sprintf("%s, you don't have a game in progress. Use !bj <amount> to start one.", message.User.DisplayName))
+		return
+	}
+	b.blackjackMutex.Unlock()
+
+	playerValue, _ := calculateHandValue(game.PlayerHand)
+	playerHandStr := handToString(game.PlayerHand, playerValue)
+
+	for {
+		dealerValue, _ := calculateHandValue(game.DealerHand)
+		if dealerValue >= 17 {
+			break
+		}
+		game.DealerHand = append(game.DealerHand, dealCard(&game.Deck))
+	}
+
+	dealerValue, _ := calculateHandValue(game.DealerHand)
+	dealerHandStr := handToString(game.DealerHand, dealerValue)
+
+	resultMsg := fmt.Sprintf("Your hand: %s. Dealer's hand: %s. ", playerHandStr, dealerHandStr)
+	var payout int64
+	var outcome string
+
+	if dealerValue > 21 {
+		payout = game.Bet * 2
+		outcome = fmt.Sprintf("Dealer busts! You win %d chips!", payout)
+	} else if playerValue > dealerValue {
+		payout = game.Bet * 2
+		outcome = fmt.Sprintf("You win %d chips!", payout)
+	} else if playerValue < dealerValue {
+		payout = 0
+		outcome = fmt.Sprintf("You lose %d chips.", game.Bet)
+	} else {
+		payout = game.Bet
+		outcome = "It's a push! Your bet is returned."
+	}
+	b.endBlackjackGame(message, resultMsg+outcome, payout)
+}
+
+// --- Other Command Handlers ---
+
+func (b *Bot) handleHelp(message twitch.PrivateMessage) {
+	commandList := "!add, !queue, !skip, !clear, !bj, !hit, !stand, !chips, !freechips, !pay, !femboy, !help"
+	b.twitchClient.Say(b.config.Channel, fmt.Sprintf("Available commands: %s", commandList))
+}
+
+func (b *Bot) handleChips(message twitch.PrivateMessage) {
+	b.chipsMutex.Lock()
+	defer b.chipsMutex.Unlock()
+	username := strings.ToLower(message.User.Name)
+	balance := b.userChips[username]
+	b.twitchClient.Say(b.config.Channel, fmt.Sprintf("%s, you have %d chips.", message.User.DisplayName, balance))
+}
+
+func (b *Bot) handleFreeChips(message twitch.PrivateMessage) {
+	username := strings.ToLower(message.User.Name)
+	b.freeChipsMutex.Lock()
+	lastClaim, hasClaimed := b.lastFreeChips[username]
+	if hasClaimed && time.Since(lastClaim) < b.freeChipsCooldown {
+		remaining := b.freeChipsCooldown - time.Since(lastClaim)
+		b.twitchClient.Say(b.config.Channel, fmt.Sprintf("%s, you can claim free chips again in %v.", message.User.DisplayName, remaining.Round(time.Second)))
+		b.freeChipsMutex.Unlock()
+		return
+	}
+	b.lastFreeChips[username] = time.Now()
+	b.freeChipsMutex.Unlock()
+
+	b.chipsMutex.Lock()
+	b.userChips[username] += b.freeChipsAmount
+	newBalance := b.userChips[username]
+	b.chipsMutex.Unlock()
+
+	b.twitchClient.Say(b.config.Channel, fmt.Sprintf("%s, here are %d free chips! Your new balance is %d.", message.User.DisplayName, b.freeChipsAmount, newBalance))
 }
 
 func (b *Bot) handleAdd(message twitch.PrivateMessage) {
@@ -194,7 +485,7 @@ func (b *Bot) handleFemboy(message twitch.PrivateMessage) {
 }
 
 // --- Music & Player Logic ---
-
+// ... (This section is unchanged, so I'll omit it for brevity) ...
 func (b *Bot) downloaderLoop() {
 	for {
 		var songToDownload *Song
@@ -208,24 +499,11 @@ func (b *Bot) downloaderLoop() {
 		b.queueMutex.Unlock()
 		if songToDownload != nil {
 			log.Printf("[DOWNLOADER] Found song to download: \"%s\"", songToDownload.Title)
-
-			// <<<<<<<<<<<< MODIFIED: No more re-encoding to MP3! >>>>>>>>>>>>>>>
-			// We download the best audio format directly, which is much faster and uses almost no CPU.
-			// The output template `%(id)s.%(ext)s` automatically uses the correct file extension.
-			filenameTemplate := "%(id)s.%(ext)s"
-
-			// We run the command with 'nice' to give it the lowest possible CPU priority.
-			// This guarantees it won't interfere with your games.
-			downloadCmd := exec.Command("nice", "-n", "19", "yt-dlp",
-				"-f", "bestaudio",
-				"-o", filenameTemplate,
-				songToDownload.URL)
-
+			filenameTemplate := filepath.Join(b.downloadDir, "%(id)s.%(ext)s")
+			downloadCmd := exec.Command("nice", "-n", "19", "yt-dlp", "-f", "bestaudio", "-o", filenameTemplate, songToDownload.URL)
 			if err := downloadCmd.Run(); err != nil {
 				log.Printf("[ERROR] Failed to download \"%s\": %v", songToDownload.Title, err)
 			} else {
-				// To get the actual filename (e.g., "videoID.opus"), we have to ask yt-dlp again.
-				// This is a very fast operation.
 				getFilenameCmd := exec.Command("yt-dlp", "--get-filename", "-f", "bestaudio", "-o", filenameTemplate, songToDownload.URL)
 				output, err := getFilenameCmd.Output()
 				if err != nil {
@@ -247,12 +525,11 @@ func (b *Bot) downloaderLoop() {
 		time.Sleep(2 * time.Second)
 	}
 }
-
 func (b *Bot) playerLoop() {
 	for {
 		var songToPlay *Song
 		b.queueMutex.Lock()
-		if b.playerCmd == nil && len(b.songQueue) > 0 && b.songQueue[0].FilePath != "" {
+		if len(b.songQueue) > 0 && b.songQueue[0].FilePath != "" {
 			songToPlay = &b.songQueue[0]
 			b.songQueue = b.songQueue[1:]
 		}
@@ -264,40 +541,166 @@ func (b *Bot) playerLoop() {
 		time.Sleep(1 * time.Second)
 	}
 }
-
 func (b *Bot) playFile(song Song) {
-	defer func() {
-		log.Printf("[CLEANUP] Deleting file: %s", song.FilePath)
-		os.Remove(song.FilePath)
-	}()
-
 	log.Printf("▶️ Now Playing: \"%s\"", song.Title)
 	b.twitchClient.Say(b.config.Channel, fmt.Sprintf("Now playing: %s", song.Title))
-
-	// <<<<<<<<<<<< MODIFIED: Run ffplay with 'nice' and keep it quiet >>>>>>>>>>>>>>>
-	playerCmd := exec.Command("nice", "-n", "19", "ffplay",
-		"-nodisp",
-		"-autoexit",
-		"-loglevel", "error",
-		song.FilePath)
-
+	playerCmd := exec.Command("nice", "-n", "19", "ffplay", "-nodisp", "-autoexit", "-loglevel", "error", song.FilePath)
 	playerCmd.Stdout = os.Stdout
 	playerCmd.Stderr = os.Stderr
-
 	b.queueMutex.Lock()
 	b.playerCmd = playerCmd
 	b.queueMutex.Unlock()
-
 	playerCmd.Run()
-
 	b.queueMutex.Lock()
 	b.playerCmd = nil
 	b.queueMutex.Unlock()
-
 	log.Printf("⏹️ Finished Playing: \"%s\"", song.Title)
 }
+func (b *Bot) cleanupLoop() {
+	ticker := time.NewTicker(b.cleanupInterval)
+	defer ticker.Stop()
+	for range ticker.C {
+		log.Printf("[CLEANUP] Scanning for files older than %v in %s", b.cleanupInterval, b.downloadDir)
+		files, err := os.ReadDir(b.downloadDir)
+		if err != nil {
+			log.Printf("[ERROR] Cleanup failed: Could not read download directory: %v", err)
+			continue
+		}
+		for _, file := range files {
+			filePath := filepath.Join(b.downloadDir, file.Name())
+			info, err := file.Info()
+			if err != nil {
+				log.Printf("[ERROR] Cleanup failed: Could not get file info for %s: %v", filePath, err)
+				continue
+			}
+			if time.Since(info.ModTime()) > b.cleanupInterval {
+				log.Printf("[CLEANUP] Deleting old file: %s", filePath)
+				err := os.Remove(filePath)
+				if err != nil {
+					log.Printf("[ERROR] Cleanup failed: Could not delete file %s: %v", filePath, err)
+				}
+			}
+		}
+	}
+}
 
-// --- Utility Functions ---
+// --- Utility & Persistence Functions ---
+
+func (b *Bot) endBlackjackGame(message twitch.PrivateMessage, resultMessage string, payout int64) {
+	username := strings.ToLower(message.User.Name)
+	b.blackjackMutex.Lock()
+	defer b.blackjackMutex.Unlock()
+	b.chipsMutex.Lock()
+	defer b.chipsMutex.Unlock()
+
+	// Only modify chips and send a message if there's a result to report.
+	// This prevents duplicate messages when called from handleHit for a bust.
+	if resultMessage != "" {
+		b.userChips[username] += payout
+		finalMsg := fmt.Sprintf("%s, %s Your new balance is %d.", message.User.DisplayName, resultMessage, b.userChips[username])
+		b.twitchClient.Say(b.config.Channel, finalMsg)
+	} else if payout == 0 { // This is a bust scenario
+		b.userChips[username] += 0 // Payout is 0 on a bust, chips are already deducted.
+		finalMsg := fmt.Sprintf("Your new balance is %d.", b.userChips[username])
+		b.twitchClient.Say(b.config.Channel, fmt.Sprintf("%s, %s", message.User.DisplayName, finalMsg))
+	}
+
+	delete(b.blackjackGames, username)
+}
+
+func newDeck() []Card {
+	suits := []string{"♥", "♦", "♣", "♠"}
+	ranks := []string{"2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K", "A"}
+	var deck []Card
+	for _, suit := range suits {
+		for _, rank := range ranks {
+			value := 0
+			switch rank {
+			case "J", "Q", "K":
+				value = 10
+			case "A":
+				value = 11
+			default:
+				value, _ = strconv.Atoi(rank)
+			}
+			deck = append(deck, Card{Rank: rank, Suit: suit, Value: value})
+		}
+	}
+	return deck
+}
+
+func shuffleDeck(deck []Card) {
+	rand.Shuffle(len(deck), func(i, j int) { deck[i], deck[j] = deck[j], deck[i] })
+}
+
+func dealCard(deck *[]Card) Card {
+	card := (*deck)[0]
+	*deck = (*deck)[1:]
+	return card
+}
+
+func calculateHandValue(hand []Card) (int, int) {
+	value, aces := 0, 0
+	for _, card := range hand {
+		value += card.Value
+		if card.Rank == "A" {
+			aces++
+		}
+	}
+	for value > 21 && aces > 0 {
+		value -= 10
+		aces--
+	}
+	return value, len(hand)
+}
+
+func handToString(hand []Card, value int) string {
+	var parts []string
+	for _, card := range hand {
+		parts = append(parts, card.Rank+card.Suit)
+	}
+	return fmt.Sprintf("[%s] (%d)", strings.Join(parts, ", "), value)
+}
+
+func (b *Bot) periodicSaveLoop() {
+	ticker := time.NewTicker(1 * time.Minute)
+	defer ticker.Stop()
+	for range ticker.C {
+		if err := b.saveChips(); err != nil {
+			log.Printf("[ERROR] Failed to periodically save chips: %v", err)
+		} else {
+			log.Println("[INFO] User chips saved periodically.")
+		}
+	}
+}
+
+func (b *Bot) saveChips() error {
+	b.chipsMutex.Lock()
+	defer b.chipsMutex.Unlock()
+	data, err := json.MarshalIndent(b.userChips, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal chips to JSON: %w", err)
+	}
+	return os.WriteFile(chipsFile, data, 0644)
+}
+
+func (b *Bot) loadChips() error {
+	b.chipsMutex.Lock()
+	defer b.chipsMutex.Unlock()
+	file, err := os.Open(chipsFile)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("failed to open chips file: %w", err)
+	}
+	defer file.Close()
+	data, err := io.ReadAll(file)
+	if err != nil {
+		return fmt.Errorf("failed to read chips file: %w", err)
+	}
+	return json.Unmarshal(data, &b.userChips)
+}
 
 type YTDLPInfo struct {
 	Type    string `json:"_type"`
