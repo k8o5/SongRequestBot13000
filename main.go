@@ -50,6 +50,7 @@ type Config struct {
 	TtsIgnoreUser    string
 	OpenRouterAPIKey string
 	OpenRouterModel  string
+	Personality      string
 }
 
 // --- Main Application Logic ---
@@ -456,11 +457,14 @@ type OpenRouterResponse struct {
 }
 
 func (b *Bot) getOpenRouterResponse(prompt string) (string, error) {
+	messages := []OpenRouterMessage{
+		{Role: "system", Content: b.config.Personality},
+		{Role: "user", Content: prompt},
+	}
+
 	requestBody, err := json.Marshal(OpenRouterRequest{
-		Model: b.config.OpenRouterModel,
-		Messages: []OpenRouterMessage{
-			{Role: "user", Content: prompt},
-		},
+		Model:    b.config.OpenRouterModel,
+		Messages: messages,
 	})
 	if err != nil {
 		return "", fmt.Errorf("failed to create OpenRouter request: %w", err)
@@ -511,6 +515,7 @@ func loadConfig(path string) (*Config, error) {
 			orSec, _ := cfg.NewSection("OpenRouter")
 			orSec.NewKey("api_key", "your_openrouter_api_key")
 			orSec.NewKey("model", "your_openrouter_model")
+			orSec.NewKey("personality", "You are a helpful Twitch chat bot.")
 			cfg.SaveTo(path)
 			return nil, fmt.Errorf("config.ini not found. A new one was created. Please fill it out.")
 		}
@@ -523,6 +528,7 @@ func loadConfig(path string) (*Config, error) {
 		TtsIgnoreUser:    file.Section("Twitch").Key("tts_ignore_user").String(),
 		OpenRouterAPIKey: file.Section("OpenRouter").Key("api_key").String(),
 		OpenRouterModel:  file.Section("OpenRouter").Key("model").String(),
+		Personality:      file.Section("OpenRouter").Key("personality").String(),
 	}, nil
 }
 
