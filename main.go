@@ -25,6 +25,7 @@ import (
 
 const audioDir = "audio_cache"
 const maxSongDuration = 900 // 15 minutes in seconds
+const maxHistorySize = 20
 
 type Song struct {
 	ID       string
@@ -41,6 +42,7 @@ type Bot struct {
 	playerCmd    *exec.Cmd
 	nowPlayingID string
 	ttsEnabled   bool // <-- NEU: Status für Text-to-Speech
+	chatHistory  []OpenRouterMessage
 }
 
 type Config struct {
@@ -71,12 +73,14 @@ func main() {
 		log.Fatalf("[FATAL] Could not load config.ini: %v", err)
 	}
 	bot := &Bot{
-		config:     cfg,
-		songQueue:  make([]Song, 0),
-		ttsEnabled: true, // Standardmäßig ist TTS ausgeschaltet
+		config:      cfg,
+		songQueue:   make([]Song, 0),
+		ttsEnabled:  true, // Standardmäßig ist TTS ausgeschaltet
+		chatHistory: make([]OpenRouterMessage, 0),
 	}
 	go bot.downloaderLoop()
 	go bot.playerLoop()
+	go bot.periodicCommenterLoop()
 	bot.twitchClient = twitch.NewClient(cfg.BotUsername, cfg.OAuthToken)
 	bot.twitchClient.OnPrivateMessage(bot.handleTwitchMessage)
 	bot.twitchClient.OnConnect(func() {
@@ -102,19 +106,26 @@ func main() {
 
 func (b *Bot) handleTwitchMessage(message twitch.PrivateMessage) {
 	log.Printf("[CHAT] <%s> %s", message.User.DisplayName, message.Message)
+	b.addMessageToHistory("user", fmt.Sprintf("%s: %s", message.User.DisplayName, message.Message))
 
 	botMention := "@" + b.config.BotUsername
 	// 1. Check for AI mention first
 	if strings.HasPrefix(strings.ToLower(message.Message), strings.ToLower(botMention)) {
-		prompt := strings.TrimSpace(strings.TrimPrefix(message.Message, botMention))
+		// The message is already in the history. We just need to trigger a response.
 		go func() {
-			response, err := b.getOpenRouterResponse(prompt)
+			b.queueMutex.Lock()
+			historyCopy := make([]OpenRouterMessage, len(b.chatHistory))
+			copy(historyCopy, b.chatHistory)
+			b.queueMutex.Unlock()
+
+			response, err := b.getOpenRouterResponse(historyCopy)
 			if err != nil {
 				log.Printf("[ERROR] OpenRouter API error: %v", err)
 				// b.twitchClient.Say(b.config.Channel, "Sorry, I had trouble thinking of a response.")
 				return
 			}
 			b.twitchClient.Say(b.config.Channel, response)
+			b.addMessageToHistory("assistant", response)
 		}()
 		return // It's a mention, so we're done.
 	}
@@ -154,38 +165,47 @@ func (b *Bot) handleTwitchMessage(message twitch.PrivateMessage) {
 
 func (b *Bot) handleTtsToggle(message twitch.PrivateMessage) {
 	if !isUserMod(message) {
-		b.twitchClient.Say(b.config.Channel, "You do not have permission to control TTS.")
+		response := "You do not have permission to control TTS."
+		b.twitchClient.Say(b.config.Channel, response)
+		b.addMessageToHistory("assistant", response)
 		return
 	}
 
 	parts := strings.Fields(message.Message)
 	if len(parts) < 2 {
-		b.twitchClient.Say(b.config.Channel, "Usage: !tts <on|off>")
+		response := "Usage: !tts <on|off>"
+		b.twitchClient.Say(b.config.Channel, response)
+		b.addMessageToHistory("assistant", response)
 		return
 	}
 
 	b.queueMutex.Lock()
 	defer b.queueMutex.Unlock()
 
+	var response string
 	switch strings.ToLower(parts[1]) {
 	case "on":
 		b.ttsEnabled = true
-		b.twitchClient.Say(b.config.Channel, "TTS is now ON.")
+		response = "TTS is now ON."
 		log.Println("[TTS] TTS has been enabled.")
 	case "off":
 		b.ttsEnabled = false
-		b.twitchClient.Say(b.config.Channel, "TTS is now OFF.")
+		response = "TTS is now OFF."
 		log.Println("[TTS] TTS has been disabled.")
 	default:
-		b.twitchClient.Say(b.config.Channel, "Usage: !tts <on|off>")
+		response = "Usage: !tts <on|off>"
 	}
+	b.twitchClient.Say(b.config.Channel, response)
+	b.addMessageToHistory("assistant", response)
 }
 
 // ... (Restliche handle-Funktionen bleiben unverändert) ...
 func (b *Bot) handleAdd(message twitch.PrivateMessage) {
 	parts := strings.Fields(message.Message)
 	if len(parts) < 2 {
-		b.twitchClient.Say(b.config.Channel, "Usage: !add <YouTube URL or search term>")
+		response := "Usage: !add <YouTube URL or search term>"
+		b.twitchClient.Say(b.config.Channel, response)
+		b.addMessageToHistory("assistant", response)
 		return
 	}
 	query := strings.Join(parts[1:], " ")
@@ -195,7 +215,9 @@ func (b *Bot) handleAdd(message twitch.PrivateMessage) {
 		info, err := getAndValidateVideoInfo(query)
 		if err != nil {
 			log.Printf("[VALIDATION] Failed for query \"%s\": %v", query, err)
-			b.twitchClient.Say(b.config.Channel, fmt.Sprintf("Error: %v", err))
+			response := fmt.Sprintf("Error: %v", err)
+			b.twitchClient.Say(b.config.Channel, response)
+			b.addMessageToHistory("assistant", response)
 			return
 		}
 
@@ -204,12 +226,16 @@ func (b *Bot) handleAdd(message twitch.PrivateMessage) {
 
 		// Step 2: Check for duplicates in the queue or currently playing song.
 		if b.nowPlayingID == info.ID {
-			b.twitchClient.Say(b.config.Channel, fmt.Sprintf(`Song "%s" is currently playing.`, info.Title))
+			response := fmt.Sprintf(`Song "%s" is currently playing.`, info.Title)
+			b.twitchClient.Say(b.config.Channel, response)
+			b.addMessageToHistory("assistant", response)
 			return
 		}
 		for _, song := range b.songQueue {
 			if song.ID == info.ID {
-				b.twitchClient.Say(b.config.Channel, fmt.Sprintf(`Song "%s" is already in the queue.`, info.Title))
+				response := fmt.Sprintf(`Song "%s" is already in the queue.`, info.Title)
+				b.twitchClient.Say(b.config.Channel, response)
+				b.addMessageToHistory("assistant", response)
 				return
 			}
 		}
@@ -217,7 +243,9 @@ func (b *Bot) handleAdd(message twitch.PrivateMessage) {
 		// Step 3: Add the validated song to the queue.
 		songToAdd := Song{ID: info.ID, URL: info.URL, Title: info.Title, FilePath: ""}
 		b.songQueue = append(b.songQueue, songToAdd)
-		b.twitchClient.Say(b.config.Channel, fmt.Sprintf(`Song "%s" added! Position: %d`, songToAdd.Title, len(b.songQueue)))
+		response := fmt.Sprintf(`Song "%s" added! Position: %d`, songToAdd.Title, len(b.songQueue))
+		b.twitchClient.Say(b.config.Channel, response)
+		b.addMessageToHistory("assistant", response)
 	}()
 }
 
@@ -225,22 +253,33 @@ func (b *Bot) handleShowQueue() {
 	b.queueMutex.Lock()
 	defer b.queueMutex.Unlock()
 	if len(b.songQueue) == 0 {
-		b.twitchClient.Say(b.config.Channel, "The song queue is empty.")
+		response := "The song queue is empty."
+		b.twitchClient.Say(b.config.Channel, response)
+		b.addMessageToHistory("assistant", response)
 		return
 	}
+	// This one is a bit different as it says multiple lines.
+	// I will just add the header to the history.
 	b.twitchClient.Say(b.config.Channel, "--- Current Queue ---")
+	b.addMessageToHistory("assistant", "--- Current Queue ---")
 	for i, song := range b.songQueue {
 		if i >= 3 {
-			b.twitchClient.Say(b.config.Channel, fmt.Sprintf("...and %d more.", len(b.songQueue)-i))
+			response := fmt.Sprintf("...and %d more.", len(b.songQueue)-i)
+			b.twitchClient.Say(b.config.Channel, response)
+			b.addMessageToHistory("assistant", response)
 			break
 		}
-		b.twitchClient.Say(b.config.Channel, fmt.Sprintf("%d. %s", i+1, song.Title))
+		response := fmt.Sprintf("%d. %s", i+1, song.Title)
+		b.twitchClient.Say(b.config.Channel, response)
+		b.addMessageToHistory("assistant", response)
 	}
 }
 
 func (b *Bot) handleSkip(message twitch.PrivateMessage) {
 	if !isUserMod(message) {
-		b.twitchClient.Say(b.config.Channel, "You do not have permission to skip songs.")
+		response := "You do not have permission to skip songs."
+		b.twitchClient.Say(b.config.Channel, response)
+		b.addMessageToHistory("assistant", response)
 		return
 	}
 	b.queueMutex.Lock()
@@ -255,11 +294,15 @@ func (b *Bot) handleSkip(message twitch.PrivateMessage) {
 
 func (b *Bot) handleFemboy(message twitch.PrivateMessage) {
 	percentage := rand.Intn(101)
-	b.twitchClient.Say(b.config.Channel, fmt.Sprintf("%s, you are %d%% femboy!", message.User.DisplayName, percentage))
+	response := fmt.Sprintf("%s, you are %d%% femboy!", message.User.DisplayName, percentage)
+	b.twitchClient.Say(b.config.Channel, response)
+	b.addMessageToHistory("assistant", response)
 }
 
 func (b *Bot) handleHelp() {
-	b.twitchClient.Say(b.config.Channel, "Available commands: !add <url/search>, !queue, !skip (mods only), !tts <on/off> (mods only), !femboy")
+	response := "Available commands: !add <url/search>, !queue, !skip (mods only), !tts <on/off> (mods only), !femboy"
+	b.twitchClient.Say(b.config.Channel, response)
+	b.addMessageToHistory("assistant", response)
 }
 // --- Music, Player & TTS Logic ---
 
@@ -313,7 +356,9 @@ func (b *Bot) downloaderLoop() {
 			b.queueMutex.Lock()
 			if err != nil || actualFilename == "" {
 				log.Printf("[ERROR] Download failed for \"%s\". Removing from queue.", songToDownload.Title)
-				b.twitchClient.Say(b.config.Channel, fmt.Sprintf("Error: Could not download '%s'. Skipping.", songToDownload.Title))
+				response := fmt.Sprintf("Error: Could not download '%s'. Skipping.", songToDownload.Title)
+				b.twitchClient.Say(b.config.Channel, response)
+				b.addMessageToHistory("assistant", response)
 
 				newQueue := make([]Song, 0, len(b.songQueue))
 				for _, song := range b.songQueue {
@@ -364,7 +409,9 @@ func (b *Bot) playFile(song Song) {
 	}()
 
 	log.Printf("▶️ Now Playing: \"%s\"", song.Title)
-	b.twitchClient.Say(b.config.Channel, fmt.Sprintf("Now playing: %s", song.Title))
+	response := fmt.Sprintf("Now playing: %s", song.Title)
+	b.twitchClient.Say(b.config.Channel, response)
+	b.addMessageToHistory("assistant", response)
 
 	playerCmd := exec.Command("nice", "-n", "19", "ffplay",
 		"-nodisp",
@@ -456,15 +503,12 @@ type OpenRouterResponse struct {
 	} `json:"choices"`
 }
 
-func (b *Bot) getOpenRouterResponse(prompt string) (string, error) {
-	messages := []OpenRouterMessage{
-		{Role: "system", Content: b.config.Personality},
-		{Role: "user", Content: prompt},
-	}
+func (b *Bot) getOpenRouterResponse(messages []OpenRouterMessage) (string, error) {
+	messagesWithPersonality := append([]OpenRouterMessage{{Role: "system", Content: b.config.Personality}}, messages...)
 
 	requestBody, err := json.Marshal(OpenRouterRequest{
 		Model:    b.config.OpenRouterModel,
-		Messages: messages,
+		Messages: messagesWithPersonality,
 	})
 	if err != nil {
 		return "", fmt.Errorf("failed to create OpenRouter request: %w", err)
@@ -536,4 +580,46 @@ func isUserMod(message twitch.PrivateMessage) bool {
 	_, isMod := message.User.Badges["moderator"]
 	_, isBroadcaster := message.User.Badges["broadcaster"]
 	return isMod || isBroadcaster
+}
+
+func (b *Bot) addMessageToHistory(role, content string) {
+	b.queueMutex.Lock()
+	defer b.queueMutex.Unlock()
+
+	b.chatHistory = append(b.chatHistory, OpenRouterMessage{Role: role, Content: content})
+	if len(b.chatHistory) > maxHistorySize {
+		b.chatHistory = b.chatHistory[1:]
+	}
+}
+
+func (b *Bot) periodicCommenterLoop() {
+	ticker := time.NewTicker(1 * time.Minute)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		log.Println("[COMMENTER] Time to comment...")
+
+		b.queueMutex.Lock()
+		if len(b.chatHistory) < 5 { // Don't comment if there's not enough history
+			b.queueMutex.Unlock()
+			continue
+		}
+		historyCopy := make([]OpenRouterMessage, len(b.chatHistory))
+		copy(historyCopy, b.chatHistory)
+		b.queueMutex.Unlock()
+
+		// Add a special prompt for the commenter
+		commenterPrompt := "Please provide a short, engaging comment summarizing the recent chat conversation. The comment should be in the same language as the conversation."
+		messagesWithPrompt := append(historyCopy, OpenRouterMessage{Role: "user", Content: commenterPrompt})
+
+		response, err := b.getOpenRouterResponse(messagesWithPrompt)
+		if err != nil {
+			log.Printf("[ERROR] Commenter failed to get response: %v", err)
+			continue
+		}
+
+		b.twitchClient.Say(b.config.Channel, response)
+		b.addMessageToHistory("assistant", response)
+		log.Printf("[COMMENTER] Said: %s", response)
+	}
 }
