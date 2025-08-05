@@ -1,10 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"math/rand"
+	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -41,10 +44,12 @@ type Bot struct {
 }
 
 type Config struct {
-	BotUsername   string
-	Channel       string
-	OAuthToken    string
-	TtsIgnoreUser string // <-- NEU: Benutzer, dessen Nachrichten ignoriert werden sollen
+	BotUsername      string
+	Channel          string
+	OAuthToken       string
+	TtsIgnoreUser    string
+	OpenRouterAPIKey string
+	OpenRouterModel  string
 }
 
 // --- Main Application Logic ---
@@ -97,7 +102,23 @@ func main() {
 func (b *Bot) handleTwitchMessage(message twitch.PrivateMessage) {
 	log.Printf("[CHAT] <%s> %s", message.User.DisplayName, message.Message)
 
-	// Command handling
+	botMention := "@" + b.config.BotUsername
+	// 1. Check for AI mention first
+	if strings.HasPrefix(strings.ToLower(message.Message), strings.ToLower(botMention)) {
+		prompt := strings.TrimSpace(strings.TrimPrefix(message.Message, botMention))
+		go func() {
+			response, err := b.getOpenRouterResponse(prompt)
+			if err != nil {
+				log.Printf("[ERROR] OpenRouter API error: %v", err)
+				// b.twitchClient.Say(b.config.Channel, "Sorry, I had trouble thinking of a response.")
+				return
+			}
+			b.twitchClient.Say(b.config.Channel, response)
+		}()
+		return // It's a mention, so we're done.
+	}
+
+	// 2. Check for commands
 	if strings.HasPrefix(message.Message, "!") {
 		parts := strings.Fields(message.Message)
 		command := strings.ToLower(parts[0])
@@ -112,18 +133,17 @@ func (b *Bot) handleTwitchMessage(message twitch.PrivateMessage) {
 			b.handleFemboy(message)
 		case "!help":
 			b.handleHelp()
-		case "!tts": // <-- NEU: Befehl zur Steuerung von TTS
+		case "!tts":
 			b.handleTtsToggle(message)
 		}
-		return // Stop processing after a command
+		return // It's a command, so we're done.
 	}
 
-	// --- TTS Logic ---
+	// 3. If it's not a mention or command, handle TTS
 	b.queueMutex.Lock()
 	isTtsOn := b.ttsEnabled
 	b.queueMutex.Unlock()
 
-	// Read message aloud if TTS is on, it's not a command, and not from the ignored user or the bot itself
 	if isTtsOn &&
 		strings.ToLower(message.User.Name) != strings.ToLower(b.config.TtsIgnoreUser) &&
 		strings.ToLower(message.User.Name) != strings.ToLower(b.config.BotUsername) {
@@ -415,26 +435,94 @@ func getAndValidateVideoInfo(query string) (*YTDLPInfo, error) {
 	return &info, nil
 }
 
+// --- OpenRouter API ---
+
+type OpenRouterRequest struct {
+	Model    string            `json:"model"`
+	Messages []OpenRouterMessage `json:"messages"`
+}
+
+type OpenRouterMessage struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
+}
+
+type OpenRouterResponse struct {
+	Choices []struct {
+		Message struct {
+			Content string `json:"content"`
+		} `json:"message"`
+	} `json:"choices"`
+}
+
+func (b *Bot) getOpenRouterResponse(prompt string) (string, error) {
+	requestBody, err := json.Marshal(OpenRouterRequest{
+		Model: b.config.OpenRouterModel,
+		Messages: []OpenRouterMessage{
+			{Role: "user", Content: prompt},
+		},
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to create OpenRouter request: %w", err)
+	}
+
+	req, err := http.NewRequest("POST", "https://openrouter.ai/api/v1/chat/completions", bytes.NewBuffer(requestBody))
+	if err != nil {
+		return "", fmt.Errorf("failed to create http request: %w", err)
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+b.config.OpenRouterAPIKey)
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("failed to send request to OpenRouter: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("OpenRouter API returned non-200 status code: %d %s", resp.StatusCode, string(body))
+	}
+
+	var openRouterResponse OpenRouterResponse
+	if err := json.NewDecoder(resp.Body).Decode(&openRouterResponse); err != nil {
+		return "", fmt.Errorf("failed to decode OpenRouter response: %w", err)
+	}
+
+	if len(openRouterResponse.Choices) > 0 && openRouterResponse.Choices[0].Message.Content != "" {
+		return openRouterResponse.Choices[0].Message.Content, nil
+	}
+
+	return "I am unable to provide a response at this time.", nil
+}
+
 func loadConfig(path string) (*Config, error) {
 	file, err := ini.Load(path)
 	if err != nil {
 		if os.IsNotExist(err) {
 			cfg := ini.Empty()
-			sec, _ := cfg.NewSection("Twitch")
-			sec.NewKey("bot_username", "your_bot_name")
-			sec.NewKey("channel", "your_channel_name")
-			sec.NewKey("oauth_token", "oauth:your_token_here")
-			sec.NewKey("tts_ignore_user", "k8o5") // <-- NEU: Standardwert für ignorierten Benutzer
+			twitchSec, _ := cfg.NewSection("Twitch")
+			twitchSec.NewKey("bot_username", "your_bot_name")
+			twitchSec.NewKey("channel", "your_channel_name")
+			twitchSec.NewKey("oauth_token", "oauth:your_token_here")
+			twitchSec.NewKey("tts_ignore_user", "some_user_to_ignore")
+			orSec, _ := cfg.NewSection("OpenRouter")
+			orSec.NewKey("api_key", "your_openrouter_api_key")
+			orSec.NewKey("model", "your_openrouter_model")
 			cfg.SaveTo(path)
 			return nil, fmt.Errorf("config.ini not found. A new one was created. Please fill it out.")
 		}
 		return nil, fmt.Errorf("failed to read config file: %w", err)
 	}
 	return &Config{
-		BotUsername:   file.Section("Twitch").Key("bot_username").String(),
-		Channel:       file.Section("Twitch").Key("channel").String(),
-		OAuthToken:    file.Section("Twitch").Key("oauth_token").String(),
-		TtsIgnoreUser: file.Section("Twitch").Key("tts_ignore_user").String(), // <-- NEU: Auslesen aus der Config
+		BotUsername:      file.Section("Twitch").Key("bot_username").String(),
+		Channel:          file.Section("Twitch").Key("channel").String(),
+		OAuthToken:       file.Section("Twitch").Key("oauth_token").String(),
+		TtsIgnoreUser:    file.Section("Twitch").Key("tts_ignore_user").String(),
+		OpenRouterAPIKey: file.Section("OpenRouter").Key("api_key").String(),
+		OpenRouterModel:  file.Section("OpenRouter").Key("model").String(),
 	}, nil
 }
 
