@@ -162,12 +162,12 @@ func (b *Bot) handleTwitchMessage(message twitch.PrivateMessage) {
 	b.lastMessageTime = time.Now() // Reset idle timer on any message
 	log.Printf("[CHAT] <%s> %s", message.User.DisplayName, message.Message)
 
-	botMention := "@" + b.config.BotUsername
-	// Respond if the bot's name is mentioned anywhere in the message.
-	if strings.Contains(strings.ToLower(message.Message), strings.ToLower(botMention)) {
+	// Regex to detect the bot's name, with or without an @, as a whole word.
+	mentionPattern := `(?i)\b(@)?` + regexp.QuoteMeta(b.config.BotUsername) + `\b`
+	mentionRegex := regexp.MustCompile(mentionPattern)
+
+	if mentionRegex.MatchString(message.Message) {
 		// Remove the mention from the message to create the prompt.
-		// This uses a case-insensitive regex replacement to handle various capitalizations.
-		mentionRegex := regexp.MustCompile("(?i)" + regexp.QuoteMeta(botMention))
 		prompt := strings.TrimSpace(mentionRegex.ReplaceAllString(message.Message, ""))
 
 		// BUG FIX: If the message was just the bot's name, the prompt will be empty.
@@ -210,10 +210,12 @@ func (b *Bot) handleTwitchMessage(message twitch.PrivateMessage) {
 				}
 			}
 
-			// Send the text part of the response to chat
-			chatResponse := strings.TrimSpace(strings.Join(chatResponseParts, "\n"))
-			if chatResponse != "" {
-				b.twitchClient.Say(b.config.Channel, chatResponse)
+			// Send the text part of the response to chat, line by line, to handle multi-line messages.
+			for _, line := range chatResponseParts {
+				trimmedLine := strings.TrimSpace(line)
+				if trimmedLine != "" {
+					b.twitchClient.Say(b.config.Channel, trimmedLine)
+				}
 			}
 
 			// Send a confirmation message if the AI added songs
@@ -929,7 +931,7 @@ func (b *Bot) getOpenRouterResponse() (string, error) {
 	// Add the system prompt first.
 	systemPrompt := b.config.Personality
 	if strings.ToLower(b.config.BotUsername) == "k8o5bot" {
-		systemPrompt = "You are k8o5bot, a witty and helpful AI assistant in a Twitch chat. You are knowledgeable about gaming, programming, and internet culture. Keep your responses concise and engaging. The channel broadcaster is k8o5. You have a tool to add songs to the queue. If a user asks you to create a playlist or add a song, respond with `ADD_SONG: <song name or youtube url>` on a new line for each song. Example: 'Sure, here's a chill playlist for you:\\nADD_SONG: lofi hip hop radio\\nADD_SONG: ChilledCow' - The user will not see the `ADD_SONG:` lines, just your text."
+		systemPrompt = "You are k8o5bot, a witty and helpful AI assistant in a Twitch chat. You are knowledgeable about gaming, programming, and internet culture. You are multilingual and should always respond in the same language as the user's prompt. Keep your responses concise and engaging. The channel broadcaster is k8o5. You have a tool to add songs to the queue. If a user asks you to create a playlist or add a song, respond with `ADD_SONG: <song name or youtube url>` on a new line for each song. Example: 'Sure, here's a chill playlist for you:\\nADD_SONG: lofi hip hop radio\\nADD_SONG: ChilledCow' - The user will not see the `ADD_SONG:` lines, just your text."
 	}
 	if systemPrompt != "" {
 		messages = append(messages, OpenRouterMessage{Role: "system", Content: systemPrompt})
