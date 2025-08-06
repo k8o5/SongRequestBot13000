@@ -64,6 +64,8 @@ type Bot struct {
 	blackjackMutex      sync.Mutex
 	blackjackGames      map[string]*BlackjackGame // Key is lowercase username
 	conversationHistory []OpenRouterMessage
+	freeModels          []string
+	lastMessageTime     time.Time
 }
 
 type Config struct {
@@ -102,16 +104,28 @@ func main() {
 		freeChipsAmount:   500,
 		blackjackGames:      make(map[string]*BlackjackGame),
 		conversationHistory: make([]OpenRouterMessage, 0),
+		freeModels:          make([]string, 0),
+		lastMessageTime:     time.Now(),
 	}
 
 	if err := bot.loadChips(); err != nil {
 		log.Printf("[WARN] Could not load user chips, starting fresh: %v", err)
 	}
 
+	log.Println("[INFO] Fetching free models from OpenRouter...")
+	freeModels, err := getFreeModels()
+	if err != nil {
+		log.Printf("[WARN] Could not fetch free models from OpenRouter: %v. Idle chatter will be disabled.", err)
+	} else {
+		bot.freeModels = freeModels
+		log.Printf("[INFO] Found %d free models.", len(bot.freeModels))
+	}
+
 	go bot.downloaderLoop()
 	go bot.playerLoop()
 	go bot.cleanupLoop()
 	go bot.periodicSaveLoop()
+	go bot.idleChatterLoop()
 
 	bot.twitchClient = twitch.NewClient(cfg.BotUsername, cfg.OAuthToken)
 	bot.twitchClient.OnPrivateMessage(bot.handleTwitchMessage)
@@ -145,6 +159,7 @@ func main() {
 // --- Twitch Command Handling ---
 
 func (b *Bot) handleTwitchMessage(message twitch.PrivateMessage) {
+	b.lastMessageTime = time.Now() // Reset idle timer on any message
 	log.Printf("[CHAT] <%s> %s", message.User.DisplayName, message.Message)
 
 	botMention := "@" + b.config.BotUsername
@@ -154,6 +169,13 @@ func (b *Bot) handleTwitchMessage(message twitch.PrivateMessage) {
 		// This uses a case-insensitive regex replacement to handle various capitalizations.
 		mentionRegex := regexp.MustCompile("(?i)" + regexp.QuoteMeta(botMention))
 		prompt := strings.TrimSpace(mentionRegex.ReplaceAllString(message.Message, ""))
+
+		// BUG FIX: If the message was just the bot's name, the prompt will be empty.
+		// Default to a simple greeting to ensure the bot responds.
+		if prompt == "" {
+			prompt = "Hello!"
+		}
+
 		go func() {
 			// Add user's message to history, which will be used by getOpenRouterResponse
 			b.addMessageToHistory("user", prompt)
@@ -836,8 +858,20 @@ func getYoutubeInfo(query string) (*YTDLPInfo, error) {
 
 // --- OpenRouter API ---
 
+type OpenRouterModel struct {
+	ID      string `json:"id"`
+	Pricing struct {
+		Prompt     string `json:"prompt"`
+		Completion string `json:"completion"`
+	} `json:"pricing"`
+}
+
+type OpenRouterModelsResponse struct {
+	Data []OpenRouterModel `json:"data"`
+}
+
 type OpenRouterRequest struct {
-	Model    string          `json:"model"`
+	Model    string            `json:"model"`
 	Messages []OpenRouterMessage `json:"messages"`
 }
 
@@ -852,6 +886,40 @@ type OpenRouterResponse struct {
 			Content string `json:"content"`
 		} `json:"message"`
 	} `json:"choices"`
+}
+
+func getFreeModels() ([]string, error) {
+	req, err := http.NewRequest("GET", "https://openrouter.ai/api/v1/models", nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create models request: %w", err)
+	}
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to send request to OpenRouter for models: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("OpenRouter models API returned non-200 status: %d %s", resp.StatusCode, string(body))
+	}
+
+	var modelsResponse OpenRouterModelsResponse
+	if err := json.NewDecoder(resp.Body).Decode(&modelsResponse); err != nil {
+		return nil, fmt.Errorf("failed to decode OpenRouter models response: %w", err)
+	}
+
+	var freeModels []string
+	for _, model := range modelsResponse.Data {
+		// As per the user's script, we check for "0" strings.
+		if model.Pricing.Prompt == "0" && model.Pricing.Completion == "0" {
+			freeModels = append(freeModels, model.ID)
+		}
+	}
+
+	return freeModels, nil
 }
 
 func (b *Bot) getOpenRouterResponse() (string, error) {
@@ -943,4 +1011,94 @@ func isUserMod(message twitch.PrivateMessage) bool {
 	_, isMod := message.User.Badges["moderator"]
 	_, isBroadcaster := message.User.Badges["broadcaster"]
 	return isMod || isBroadcaster
+}
+
+// --- Idle Chatter ---
+
+// getOpenRouterResponseForModel is a simplified version of getOpenRouterResponse that doesn't use
+// conversation history and allows specifying a model. Used by the idle chatter.
+func (b *Bot) getOpenRouterResponseForModel(prompt, modelName string) (string, error) {
+	requestBody, err := json.Marshal(OpenRouterRequest{
+		Model: modelName,
+		Messages: []OpenRouterMessage{
+			{Role: "user", Content: prompt},
+		},
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to create OpenRouter request: %w", err)
+	}
+
+	req, err := http.NewRequest("POST", "https://openrouter.ai/api/v1/chat/completions", bytes.NewBuffer(requestBody))
+	if err != nil {
+		return "", fmt.Errorf("failed to create http request: %w", err)
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+b.config.OpenRouterAPIKey)
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("failed to send request to OpenRouter: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("OpenRouter API returned non-200 status code: %d %s", resp.StatusCode, string(body))
+	}
+
+	var openRouterResponse OpenRouterResponse
+	if err := json.NewDecoder(resp.Body).Decode(&openRouterResponse); err != nil {
+		return "", fmt.Errorf("failed to decode OpenRouter response: %w", err)
+	}
+
+	if len(openRouterResponse.Choices) > 0 && openRouterResponse.Choices[0].Message.Content != "" {
+		return openRouterResponse.Choices[0].Message.Content, nil
+	}
+
+	return "", fmt.Errorf("received an empty response from the model")
+}
+
+func (b *Bot) idleChatterLoop() {
+	// A ticker that checks every 30 seconds.
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	idleThreshold := 5 * time.Minute
+	nextPrompt := "Tell me a surprising fact about the ocean."
+	modelIndex := 0
+
+	for range ticker.C {
+		if len(b.freeModels) == 0 {
+			// No free models loaded, so we can't do anything.
+			// Sleep for the idle threshold to avoid checking every 30s.
+			time.Sleep(idleThreshold)
+			continue
+		}
+
+		if time.Since(b.lastMessageTime) > idleThreshold {
+			// Pick the next model in the list, looping around.
+			modelIndex = (modelIndex + 1) % len(b.freeModels)
+			selectedModel := b.freeModels[modelIndex]
+
+			log.Printf("[IDLE CHATTER] Chat idle for over %v. Sending prompt to model '%s'.", idleThreshold, selectedModel)
+
+			response, err := b.getOpenRouterResponseForModel(nextPrompt, selectedModel)
+			if err != nil {
+				log.Printf("[IDLE CHATTER] Error from model %s: %v. Skipping.", selectedModel, err)
+				// Try the next model on the next tick with the same prompt.
+				continue
+			}
+
+			// The successful response becomes the prompt for the next model.
+			nextPrompt = response
+
+			b.twitchClient.Say(b.config.Channel, response)
+
+			// Update the last message time to now. This creates a pause equal to the
+			// idleThreshold before the *next* idle message is sent, preventing spam.
+			b.lastMessageTime = time.Now()
+		}
+	}
 }
