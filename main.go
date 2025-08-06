@@ -48,21 +48,22 @@ type BlackjackGame struct {
 }
 
 type Bot struct {
-	config            *Config
-	twitchClient      *twitch.Client
-	queueMutex        sync.Mutex
-	songQueue         []Song
-	playerCmd         *exec.Cmd
-	downloadDir       string
-	cleanupInterval   time.Duration
-	chipsMutex        sync.Mutex
-	userChips         map[string]int64 // NOTE: Key is now lowercase username
-	freeChipsMutex    sync.Mutex
-	lastFreeChips     map[string]time.Time // Key is lowercase username
-	freeChipsCooldown time.Duration
-	freeChipsAmount   int64
-	blackjackMutex    sync.Mutex
-	blackjackGames    map[string]*BlackjackGame // Key is lowercase username
+	config              *Config
+	twitchClient        *twitch.Client
+	queueMutex          sync.Mutex
+	songQueue           []Song
+	playerCmd           *exec.Cmd
+	downloadDir         string
+	cleanupInterval     time.Duration
+	chipsMutex          sync.Mutex
+	userChips           map[string]int64 // NOTE: Key is now lowercase username
+	freeChipsMutex      sync.Mutex
+	lastFreeChips       map[string]time.Time // Key is lowercase username
+	freeChipsCooldown   time.Duration
+	freeChipsAmount     int64
+	blackjackMutex      sync.Mutex
+	blackjackGames      map[string]*BlackjackGame // Key is lowercase username
+	conversationHistory []OpenRouterMessage
 }
 
 type Config struct {
@@ -71,6 +72,7 @@ type Config struct {
 	OAuthToken       string
 	OpenRouterAPIKey string
 	OpenRouterModel  string
+	Personality      string
 }
 
 // --- Main Application Logic ---
@@ -98,7 +100,8 @@ func main() {
 		lastFreeChips:     make(map[string]time.Time),
 		freeChipsCooldown: 1 * time.Hour,
 		freeChipsAmount:   500,
-		blackjackGames:    make(map[string]*BlackjackGame),
+		blackjackGames:      make(map[string]*BlackjackGame),
+		conversationHistory: make([]OpenRouterMessage, 0),
 	}
 
 	if err := bot.loadChips(); err != nil {
@@ -145,17 +148,60 @@ func (b *Bot) handleTwitchMessage(message twitch.PrivateMessage) {
 	log.Printf("[CHAT] <%s> %s", message.User.DisplayName, message.Message)
 
 	botMention := "@" + b.config.BotUsername
-	if strings.HasPrefix(strings.ToLower(message.Message), strings.ToLower(botMention)) {
-		prompt := strings.TrimSpace(strings.TrimPrefix(message.Message, botMention))
+	// Respond if the bot's name is mentioned anywhere in the message.
+	if strings.Contains(strings.ToLower(message.Message), strings.ToLower(botMention)) {
+		// Remove the mention from the message to create the prompt.
+		// This uses a case-insensitive regex replacement to handle various capitalizations.
+		mentionRegex := regexp.MustCompile("(?i)" + regexp.QuoteMeta(botMention))
+		prompt := strings.TrimSpace(mentionRegex.ReplaceAllString(message.Message, ""))
 		go func() {
-			response, err := b.getOpenRouterResponse(prompt)
+			// Add user's message to history, which will be used by getOpenRouterResponse
+			b.addMessageToHistory("user", prompt)
+			rawResponse, err := b.getOpenRouterResponse()
 			if err != nil {
 				log.Printf("[ERROR] OpenRouter API error: %v", err)
-				// Optionally, send an error message to chat
-				// b.twitchClient.Say(b.config.Channel, "Sorry, I had trouble thinking of a response.")
-				return
+				return // Don't add a failed response to history or say anything
 			}
-			b.twitchClient.Say(b.config.Channel, response)
+
+			// Add the raw response to history so the AI has context of its tool usage
+			b.addMessageToHistory("assistant", rawResponse)
+
+			// Process the response for song adding commands and chat text
+			lines := strings.Split(rawResponse, "\n")
+			var chatResponseParts []string
+			var songsAddedCount = 0
+			for _, line := range lines {
+				const addSongPrefix = "ADD_SONG:"
+				if strings.HasPrefix(strings.ToUpper(line), addSongPrefix) {
+					songQuery := strings.TrimSpace(line[len(addSongPrefix):])
+					if songQuery != "" {
+						// This is running in a goroutine, so it's safe to do the query
+						_, err := b.addSongByQuery(songQuery)
+						if err != nil {
+							log.Printf("[AI TOOL] Error adding song '%s': %v", songQuery, err)
+						} else {
+							songsAddedCount++
+						}
+					}
+				} else {
+					chatResponseParts = append(chatResponseParts, line)
+				}
+			}
+
+			// Send the text part of the response to chat
+			chatResponse := strings.TrimSpace(strings.Join(chatResponseParts, "\n"))
+			if chatResponse != "" {
+				b.twitchClient.Say(b.config.Channel, chatResponse)
+			}
+
+			// Send a confirmation message if the AI added songs
+			if songsAddedCount > 0 {
+				plural := "song"
+				if songsAddedCount > 1 {
+					plural = "songs"
+				}
+				b.twitchClient.Say(b.config.Channel, fmt.Sprintf("k8o5bot added %d %s to the queue.", songsAddedCount, plural))
+			}
 		}()
 		return // Don't process as a command if it's a mention
 	}
@@ -412,6 +458,49 @@ func (b *Bot) handleFreeChips(message twitch.PrivateMessage) {
 	b.twitchClient.Say(b.config.Channel, fmt.Sprintf("%s, here are %d free chips! Your new balance is %d.", message.User.DisplayName, b.freeChipsAmount, newBalance))
 }
 
+// addSongByQuery is a helper that fetches song info and adds it to the queue.
+// It returns the display title of what was added or an error.
+func (b *Bot) addSongByQuery(query string) (string, error) {
+	ytPattern := regexp.MustCompile(`(https?://)?(www\.)?(youtube|youtu|youtube-nocookie)\.(com|be)/.+`)
+	if !ytPattern.MatchString(query) {
+		query = "ytsearch:" + query
+	}
+
+	info, err := getYoutubeInfo(query)
+	if err != nil {
+		log.Printf("[ERROR] Could not get video info for query '%s': %v", query, err)
+		return "", fmt.Errorf("could not find a video for that request")
+	}
+
+	b.queueMutex.Lock()
+	defer b.queueMutex.Unlock()
+
+	var addedTitle string
+	if len(info.Entries) > 0 {
+		if strings.HasPrefix(query, "ytsearch:") {
+			entry := info.Entries[0]
+			songToAdd := Song{ID: entry.ID, URL: entry.URL, Title: entry.Title, FilePath: ""}
+			b.songQueue = append(b.songQueue, songToAdd)
+			addedTitle = songToAdd.Title
+		} else { // Playlist
+			count := 0
+			for i, entry := range info.Entries {
+				if i >= 10 { // Limit playlist adds to 10
+					break
+				}
+				b.songQueue = append(b.songQueue, Song{ID: entry.ID, URL: entry.URL, Title: entry.Title, FilePath: ""})
+				count++
+			}
+			addedTitle = fmt.Sprintf(`playlist "%s" (%d songs)`, info.Title, count)
+		}
+	} else { // Single video
+		songToAdd := Song{ID: info.ID, URL: info.URL, Title: info.Title, FilePath: ""}
+		b.songQueue = append(b.songQueue, songToAdd)
+		addedTitle = songToAdd.Title
+	}
+	return addedTitle, nil
+}
+
 func (b *Bot) handleAdd(message twitch.PrivateMessage) {
 	parts := strings.Fields(message.Message)
 	if len(parts) < 2 {
@@ -419,41 +508,18 @@ func (b *Bot) handleAdd(message twitch.PrivateMessage) {
 		return
 	}
 	query := strings.Join(parts[1:], " ")
-	ytPattern := regexp.MustCompile(`(https?://)?(www\.)?(youtube|youtu|youtube-nocookie)\.(com|be)/.+`)
-	if !ytPattern.MatchString(query) {
-		query = "ytsearch:" + query
-	}
+
 	go func() {
-		info, err := getYoutubeInfo(query)
+		addedTitle, err := b.addSongByQuery(query)
 		if err != nil {
-			log.Printf("[ERROR] Could not get video info: %v", err)
-			b.twitchClient.Say(b.config.Channel, "Error: Could not find a video for that request.")
+			b.twitchClient.Say(b.config.Channel, fmt.Sprintf("Error: %v", err))
 			return
 		}
+
 		b.queueMutex.Lock()
-		defer b.queueMutex.Unlock()
-		if len(info.Entries) > 0 {
-			if strings.HasPrefix(query, "ytsearch:") {
-				entry := info.Entries[0]
-				songToAdd := Song{ID: entry.ID, URL: entry.URL, Title: entry.Title, FilePath: ""}
-				b.songQueue = append(b.songQueue, songToAdd)
-				b.twitchClient.Say(b.config.Channel, fmt.Sprintf(`Song "%s" added! Position: %d`, songToAdd.Title, len(b.songQueue)))
-			} else {
-				count := 0
-				for i, entry := range info.Entries {
-					if i >= 10 {
-						break
-					}
-					b.songQueue = append(b.songQueue, Song{ID: entry.ID, URL: entry.URL, Title: entry.Title, FilePath: ""})
-					count++
-				}
-				b.twitchClient.Say(b.config.Channel, fmt.Sprintf(`Playlist "%s" added with %d songs!`, info.Title, count))
-			}
-		} else {
-			songToAdd := Song{ID: info.ID, URL: info.URL, Title: info.Title, FilePath: ""}
-			b.songQueue = append(b.songQueue, songToAdd)
-			b.twitchClient.Say(b.config.Channel, fmt.Sprintf(`Song "%s" added! Position: %d`, songToAdd.Title, len(b.songQueue)))
-		}
+		position := len(b.songQueue)
+		b.queueMutex.Unlock()
+		b.twitchClient.Say(b.config.Channel, fmt.Sprintf(`Added: %s (Position: %d)`, addedTitle, position))
 	}()
 }
 
@@ -607,6 +673,16 @@ func (b *Bot) cleanupLoop() {
 }
 
 // --- Utility & Persistence Functions ---
+
+const maxHistorySize = 10 // Keep the last 10 messages (5 pairs of user/bot)
+
+func (b *Bot) addMessageToHistory(role, content string) {
+	b.conversationHistory = append(b.conversationHistory, OpenRouterMessage{Role: role, Content: content})
+	if len(b.conversationHistory) > maxHistorySize {
+		// Keep the history size bounded by removing the oldest message.
+		b.conversationHistory = b.conversationHistory[len(b.conversationHistory)-maxHistorySize:]
+	}
+}
 
 func (b *Bot) endBlackjackGame(message twitch.PrivateMessage, resultMessage string, payout int64) {
 	username := strings.ToLower(message.User.Name)
@@ -778,12 +854,26 @@ type OpenRouterResponse struct {
 	} `json:"choices"`
 }
 
-func (b *Bot) getOpenRouterResponse(prompt string) (string, error) {
+func (b *Bot) getOpenRouterResponse() (string, error) {
+	// Prepare the messages for the API call, including history and system prompt.
+	messages := []OpenRouterMessage{}
+
+	// Add the system prompt first.
+	systemPrompt := b.config.Personality
+	if strings.ToLower(b.config.BotUsername) == "k8o5bot" {
+		systemPrompt = "You are k8o5bot, a witty and helpful AI assistant in a Twitch chat. You are knowledgeable about gaming, programming, and internet culture. Keep your responses concise and engaging. The channel broadcaster is k8o5. You have a tool to add songs to the queue. If a user asks you to create a playlist or add a song, respond with `ADD_SONG: <song name or youtube url>` on a new line for each song. Example: 'Sure, here's a chill playlist for you:\\nADD_SONG: lofi hip hop radio\\nADD_SONG: ChilledCow' - The user will not see the `ADD_SONG:` lines, just your text."
+	}
+	if systemPrompt != "" {
+		messages = append(messages, OpenRouterMessage{Role: "system", Content: systemPrompt})
+	}
+
+	// Add the conversation history.
+	messages = append(messages, b.conversationHistory...)
+
+	// Create the request body.
 	requestBody, err := json.Marshal(OpenRouterRequest{
-		Model: b.config.OpenRouterModel,
-		Messages: []OpenRouterMessage{
-			{Role: "user", Content: prompt},
-		},
+		Model:    b.config.OpenRouterModel,
+		Messages: messages,
 	})
 	if err != nil {
 		return "", fmt.Errorf("failed to create OpenRouter request: %w", err)
@@ -833,6 +923,7 @@ func loadConfig(path string) (*Config, error) {
 			orSec, _ := cfg.NewSection("OpenRouter")
 			orSec.NewKey("api_key", "your_openrouter_api_key")
 			orSec.NewKey("model", "your_openrouter_model")
+			orSec.NewKey("personality", "You are a helpful Twitch chat bot.")
 			cfg.SaveTo(path)
 			return nil, fmt.Errorf("config.ini not found. A new one was created. Please fill it out.")
 		}
@@ -844,6 +935,7 @@ func loadConfig(path string) (*Config, error) {
 		OAuthToken:       file.Section("Twitch").Key("oauth_token").String(),
 		OpenRouterAPIKey: file.Section("OpenRouter").Key("api_key").String(),
 		OpenRouterModel:  file.Section("OpenRouter").Key("model").String(),
+		Personality:      file.Section("OpenRouter").Key("personality").String(),
 	}, nil
 }
 
