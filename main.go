@@ -74,6 +74,7 @@ type Config struct {
 	OAuthToken       string
 	OpenRouterAPIKey string
 	OpenRouterModel  string
+	Personality      string
 }
 
 // --- Main Application Logic ---
@@ -214,6 +215,8 @@ func (b *Bot) handleTwitchMessage(message twitch.PrivateMessage) {
 		b.handleHelp(message)
 	case "!tts":
 		b.handleTtsToggle(message)
+	case "!idea":
+		b.handleIdea(message)
 	}
 }
 
@@ -454,7 +457,7 @@ func (b *Bot) handleStand(message twitch.PrivateMessage) {
 // --- Other Command Handlers ---
 
 func (b *Bot) handleHelp(message twitch.PrivateMessage) {
-	commandList := "!add, !queue, !skip, !clear, !bj, !hit, !stand, !chips, !freechips, !pay, !femboy, !tts, !help"
+	commandList := "!add, !queue, !skip, !clear, !bj, !hit, !stand, !chips, !freechips, !pay, !femboy, !tts, !idea, !help"
 	b.twitchClient.Say(b.config.Channel, fmt.Sprintf("Available commands: %s", commandList))
 }
 
@@ -579,6 +582,20 @@ func (b *Bot) handleClearQueue(message twitch.PrivateMessage) {
 func (b *Bot) handleFemboy(message twitch.PrivateMessage) {
 	percentage := rand.Intn(101)
 	b.twitchClient.Say(b.config.Channel, fmt.Sprintf("%s, you are %d%% femboy!", message.User.DisplayName, percentage))
+}
+
+func (b *Bot) handleIdea(message twitch.PrivateMessage) {
+	go func() {
+		prompt := "Give me a weird or funny stream idea. Be creative!"
+		response, err := b.getOpenRouterResponse(prompt)
+		if err != nil {
+			log.Printf("[ERROR] OpenRouter API error for !idea: %v", err)
+			// Optional: Send a generic error message
+			// b.twitchClient.Say(b.config.Channel, "I'm having trouble coming up with ideas right now.")
+			return
+		}
+		b.twitchClient.Say(b.config.Channel, response)
+	}()
 }
 
 // --- Music & Player Logic ---
@@ -854,11 +871,14 @@ type OpenRouterResponse struct {
 }
 
 func (b *Bot) getOpenRouterResponse(prompt string) (string, error) {
+	messages := []OpenRouterMessage{
+		{Role: "system", Content: b.config.Personality},
+		{Role: "user", Content: prompt},
+	}
+
 	requestBody, err := json.Marshal(OpenRouterRequest{
-		Model: b.config.OpenRouterModel,
-		Messages: []OpenRouterMessage{
-			{Role: "user", Content: prompt},
-		},
+		Model:    b.config.OpenRouterModel,
+		Messages: messages,
 	})
 	if err != nil {
 		return "", fmt.Errorf("failed to create OpenRouter request: %w", err)
@@ -908,6 +928,7 @@ func loadConfig(path string) (*Config, error) {
 			orSec, _ := cfg.NewSection("OpenRouter")
 			orSec.NewKey("api_key", "your_openrouter_api_key")
 			orSec.NewKey("model", "your_openrouter_model")
+			orSec.NewKey("personality", "You are a helpful Twitch chat bot.")
 			cfg.SaveTo(path)
 			return nil, fmt.Errorf("config.ini not found. A new one was created. Please fill it out.")
 		}
@@ -919,6 +940,7 @@ func loadConfig(path string) (*Config, error) {
 		OAuthToken:       file.Section("Twitch").Key("oauth_token").String(),
 		OpenRouterAPIKey: file.Section("OpenRouter").Key("api_key").String(),
 		OpenRouterModel:  file.Section("OpenRouter").Key("model").String(),
+		Personality:      file.Section("OpenRouter").Key("personality").String(),
 	}, nil
 }
 
