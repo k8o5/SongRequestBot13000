@@ -63,6 +63,9 @@ type Bot struct {
 	freeChipsAmount   int64
 	blackjackMutex    sync.Mutex
 	blackjackGames    map[string]*BlackjackGame // Key is lowercase username
+	ttsEnabled        bool
+	ttsMutex          sync.Mutex
+	ttsPlaybackMutex  sync.Mutex
 }
 
 type Config struct {
@@ -99,6 +102,7 @@ func main() {
 		freeChipsCooldown: 1 * time.Hour,
 		freeChipsAmount:   500,
 		blackjackGames:    make(map[string]*BlackjackGame),
+		ttsEnabled:        false,
 	}
 
 	if err := bot.loadChips(); err != nil {
@@ -143,6 +147,20 @@ func main() {
 
 func (b *Bot) handleTwitchMessage(message twitch.PrivateMessage) {
 	log.Printf("[CHAT] <%s> %s", message.User.DisplayName, message.Message)
+
+	// TTS Handling
+	b.ttsMutex.Lock()
+	isTTSEnabled := b.ttsEnabled
+	b.ttsMutex.Unlock()
+	// Prevent bot from reading its own messages or commands if they are handled elsewhere
+	if isTTSEnabled && strings.ToLower(message.User.Name) != strings.ToLower(b.config.BotUsername) {
+		// We also don't want to read commands/mentions twice.
+		isCommand := strings.HasPrefix(message.Message, "!")
+		isMention := strings.HasPrefix(strings.ToLower(message.Message), strings.ToLower("@"+b.config.BotUsername))
+		if !isCommand && !isMention {
+			go b.handleTTS(message)
+		}
+	}
 
 	botMention := "@" + b.config.BotUsername
 	if strings.HasPrefix(strings.ToLower(message.Message), strings.ToLower(botMention)) {
@@ -194,6 +212,63 @@ func (b *Bot) handleTwitchMessage(message twitch.PrivateMessage) {
 		b.handleFemboy(message)
 	case "!help":
 		b.handleHelp(message)
+	case "!tts":
+		b.handleTtsToggle(message)
+	}
+}
+
+func (b *Bot) handleTTS(message twitch.PrivateMessage) {
+	b.ttsPlaybackMutex.Lock()
+	defer b.ttsPlaybackMutex.Unlock()
+
+	textToSpeak := fmt.Sprintf("%s says %s", message.User.DisplayName, message.Message)
+
+	// Create a temporary file for the WAV output
+	tmpfile, err := os.CreateTemp(b.downloadDir, "tts-*.wav")
+	if err != nil {
+		log.Printf("[ERROR] TTS: Could not create temp file: %v", err)
+		return
+	}
+	defer os.Remove(tmpfile.Name()) // Clean up the file afterwards
+	tmpfileName := tmpfile.Name()
+	tmpfile.Close() // Close the file so espeak can write to it
+
+	// Generate TTS audio using espeak
+	// Using exec.Command with separate arguments prevents command injection
+	espeakCmd := exec.Command("espeak", "-w", tmpfileName, textToSpeak)
+	if err := espeakCmd.Run(); err != nil {
+		log.Printf("[ERROR] TTS: espeak command failed: %v", err)
+		// Try to inform the user in chat if espeak is likely not installed.
+		if strings.Contains(err.Error(), "executable file not found") {
+			log.Println("[WARN] TTS: 'espeak' command not found. Please install it to use TTS.")
+			// b.twitchClient.Say(b.config.Channel, "TTS is enabled, but the 'espeak' command is not installed on the server.")
+		}
+		return
+	}
+
+	// Play the generated audio file with ffplay
+	ffplayCmd := exec.Command("ffplay", "-nodisp", "-autoexit", "-loglevel", "error", tmpfileName)
+	if err := ffplayCmd.Run(); err != nil {
+		log.Printf("[ERROR] TTS: ffplay command failed: %v", err)
+		return
+	}
+}
+
+func (b *Bot) handleTtsToggle(message twitch.PrivateMessage) {
+	if !isUserMod(message) {
+		b.twitchClient.Say(b.config.Channel, "You do not have permission to toggle TTS.")
+		return
+	}
+
+	b.ttsMutex.Lock()
+	b.ttsEnabled = !b.ttsEnabled
+	isEnabled := b.ttsEnabled
+	b.ttsMutex.Unlock()
+
+	if isEnabled {
+		b.twitchClient.Say(b.config.Channel, "TTS has been enabled. Messages starting with ! will be read aloud.")
+	} else {
+		b.twitchClient.Say(b.config.Channel, "TTS has been disabled.")
 	}
 }
 
@@ -379,7 +454,7 @@ func (b *Bot) handleStand(message twitch.PrivateMessage) {
 // --- Other Command Handlers ---
 
 func (b *Bot) handleHelp(message twitch.PrivateMessage) {
-	commandList := "!add, !queue, !skip, !clear, !bj, !hit, !stand, !chips, !freechips, !pay, !femboy, !help"
+	commandList := "!add, !queue, !skip, !clear, !bj, !hit, !stand, !chips, !freechips, !pay, !femboy, !tts, !help"
 	b.twitchClient.Say(b.config.Channel, fmt.Sprintf("Available commands: %s", commandList))
 }
 
