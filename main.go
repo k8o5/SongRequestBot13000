@@ -74,6 +74,8 @@ type Config struct {
 	OAuthToken       string
 	OpenRouterAPIKey string
 	OpenRouterModel  string
+	GeminiAPIKey     string
+	GeminiModel      string
 }
 
 // --- Main Application Logic ---
@@ -166,11 +168,22 @@ func (b *Bot) handleTwitchMessage(message twitch.PrivateMessage) {
 	if strings.HasPrefix(strings.ToLower(message.Message), strings.ToLower(botMention)) {
 		prompt := strings.TrimSpace(strings.TrimPrefix(message.Message, botMention))
 		go func() {
-			response, err := b.getOpenRouterResponse(prompt)
-			if err != nil {
-				log.Printf("[ERROR] OpenRouter API error: %v", err)
-				// Optionally, send an error message to chat
-				// b.twitchClient.Say(b.config.Channel, "Sorry, I had trouble thinking of a response.")
+			var response string
+			var err error
+			if b.config.GeminiAPIKey != "" && b.config.GeminiAPIKey != "your_gemini_api_key" {
+				response, err = b.getGeminiTextResponse(prompt)
+				if err != nil {
+					log.Printf("[ERROR] Gemini API error: %v", err)
+					return
+				}
+			} else if b.config.OpenRouterAPIKey != "" && b.config.OpenRouterAPIKey != "your_openrouter_api_key" {
+				response, err = b.getOpenRouterResponse(prompt)
+				if err != nil {
+					log.Printf("[ERROR] OpenRouter API error: %v", err)
+					return
+				}
+			} else {
+				// No API key configured, so do nothing.
 				return
 			}
 			b.twitchClient.Say(b.config.Channel, response)
@@ -896,6 +909,81 @@ func (b *Bot) getOpenRouterResponse(prompt string) (string, error) {
 	return "Sorry, I couldn't come up with a response.", nil
 }
 
+// --- Gemini API ---
+
+type GeminiRequest struct {
+	Contents []GeminiContent `json:"contents"`
+}
+
+type GeminiContent struct {
+	Parts []GeminiPart `json:"parts"`
+}
+
+type GeminiPart struct {
+	Text       string      `json:"text,omitempty"`
+	InlineData *InlineData `json:"inline_data,omitempty"`
+}
+
+type InlineData struct {
+	MimeType string `json:"mime_type"`
+	Data     string `json:"data"`
+}
+
+type GeminiResponse struct {
+	Candidates []GeminiCandidate `json:"candidates"`
+}
+
+type GeminiCandidate struct {
+	Content GeminiContent `json:"content"`
+}
+
+func (b *Bot) getGeminiTextResponse(prompt string) (string, error) {
+	requestBody, err := json.Marshal(GeminiRequest{
+		Contents: []GeminiContent{
+			{
+				Parts: []GeminiPart{
+					{Text: prompt},
+				},
+			},
+		},
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to create Gemini request: %w", err)
+	}
+
+	url := "https://generativelanguage.googleapis.com/v1beta/models/" + b.config.GeminiModel + ":generateContent?key=" + b.config.GeminiAPIKey
+
+	req, err := http.NewRequest("POST", url, bytes.NewBuffer(requestBody))
+	if err != nil {
+		return "", fmt.Errorf("failed to create http request: %w", err)
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("failed to send request to Gemini: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("Gemini API returned non-200 status code: %d %s", resp.StatusCode, string(body))
+	}
+
+	var geminiResponse GeminiResponse
+	if err := json.NewDecoder(resp.Body).Decode(&geminiResponse); err != nil {
+		return "", fmt.Errorf("failed to decode Gemini response: %w", err)
+	}
+
+	if len(geminiResponse.Candidates) > 0 && len(geminiResponse.Candidates[0].Content.Parts) > 0 {
+		return geminiResponse.Candidates[0].Content.Parts[0].Text, nil
+	}
+
+	return "Sorry, I couldn't come up with a response.", nil
+}
+
 func loadConfig(path string) (*Config, error) {
 	file, err := ini.Load(path)
 	if err != nil {
@@ -908,6 +996,9 @@ func loadConfig(path string) (*Config, error) {
 			orSec, _ := cfg.NewSection("OpenRouter")
 			orSec.NewKey("api_key", "your_openrouter_api_key")
 			orSec.NewKey("model", "your_openrouter_model")
+			geminiSec, _ := cfg.NewSection("Gemini")
+			geminiSec.NewKey("api_key", "your_gemini_api_key")
+			geminiSec.NewKey("model", "gemini-1.5-flash-latest")
 			cfg.SaveTo(path)
 			return nil, fmt.Errorf("config.ini not found. A new one was created. Please fill it out.")
 		}
@@ -919,6 +1010,8 @@ func loadConfig(path string) (*Config, error) {
 		OAuthToken:       file.Section("Twitch").Key("oauth_token").String(),
 		OpenRouterAPIKey: file.Section("OpenRouter").Key("api_key").String(),
 		OpenRouterModel:  file.Section("OpenRouter").Key("model").String(),
+		GeminiAPIKey:     file.Section("Gemini").Key("api_key").String(),
+		GeminiModel:      file.Section("Gemini").Key("model").String(),
 	}, nil
 }
 
