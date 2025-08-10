@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -74,6 +75,8 @@ type Config struct {
 	OAuthToken       string
 	OpenRouterAPIKey string
 	OpenRouterModel  string
+	GeminiAPIKey     string
+	GeminiModel      string
 }
 
 // --- Main Application Logic ---
@@ -166,11 +169,22 @@ func (b *Bot) handleTwitchMessage(message twitch.PrivateMessage) {
 	if strings.HasPrefix(strings.ToLower(message.Message), strings.ToLower(botMention)) {
 		prompt := strings.TrimSpace(strings.TrimPrefix(message.Message, botMention))
 		go func() {
-			response, err := b.getOpenRouterResponse(prompt)
-			if err != nil {
-				log.Printf("[ERROR] OpenRouter API error: %v", err)
-				// Optionally, send an error message to chat
-				// b.twitchClient.Say(b.config.Channel, "Sorry, I had trouble thinking of a response.")
+			var response string
+			var err error
+			if b.config.GeminiAPIKey != "" && b.config.GeminiAPIKey != "your_gemini_api_key" {
+				response, err = b.getGeminiTextResponse(prompt)
+				if err != nil {
+					log.Printf("[ERROR] Gemini API error: %v", err)
+					return
+				}
+			} else if b.config.OpenRouterAPIKey != "" && b.config.OpenRouterAPIKey != "your_openrouter_api_key" {
+				response, err = b.getOpenRouterResponse(prompt)
+				if err != nil {
+					log.Printf("[ERROR] OpenRouter API error: %v", err)
+					return
+				}
+			} else {
+				// No API key configured, so do nothing.
 				return
 			}
 			b.twitchClient.Say(b.config.Channel, response)
@@ -214,6 +228,8 @@ func (b *Bot) handleTwitchMessage(message twitch.PrivateMessage) {
 		b.handleHelp(message)
 	case "!tts":
 		b.handleTtsToggle(message)
+	case "!opinion", "!opp":
+		b.handleOpinion(message)
 	}
 }
 
@@ -270,6 +286,34 @@ func (b *Bot) handleTtsToggle(message twitch.PrivateMessage) {
 	} else {
 		b.twitchClient.Say(b.config.Channel, "TTS has been disabled.")
 	}
+}
+
+func (b *Bot) handleOpinion(message twitch.PrivateMessage) {
+	parts := strings.Fields(message.Message)
+	if len(parts) < 2 {
+		b.twitchClient.Say(b.config.Channel, "Usage: !opinion <image_url>")
+		return
+	}
+	url := parts[1]
+
+	b.twitchClient.Say(b.config.Channel, "Downloading image and forming an opinion...")
+
+	imageBytes, err := downloadImage(url)
+	if err != nil {
+		log.Printf("[ERROR] Failed to download image for opinion: %v", err)
+		b.twitchClient.Say(b.config.Channel, "Sorry, I couldn't download the image from that URL.")
+		return
+	}
+
+	prompt := "Describe what you see in this image. What is happening on the screen?"
+	response, err := b.getGeminiVisionResponse(prompt, imageBytes)
+	if err != nil {
+		log.Printf("[ERROR] Gemini vision API error: %v", err)
+		b.twitchClient.Say(b.config.Channel, "Sorry, I had trouble forming an opinion.")
+		return
+	}
+
+	b.twitchClient.Say(b.config.Channel, response)
 }
 
 // --- Game & Chip Command Handlers ---
@@ -896,6 +940,156 @@ func (b *Bot) getOpenRouterResponse(prompt string) (string, error) {
 	return "Sorry, I couldn't come up with a response.", nil
 }
 
+func downloadImage(url string) ([]byte, error) {
+	resp, err := http.Get(url)
+	if err != nil {
+		return nil, fmt.Errorf("failed to download image: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("failed to download image: status code %d", resp.StatusCode)
+	}
+
+	bytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read image data: %w", err)
+	}
+
+	return bytes, nil
+}
+
+// --- Gemini API ---
+
+type GeminiRequest struct {
+	Contents []GeminiContent `json:"contents"`
+}
+
+type GeminiContent struct {
+	Parts []GeminiPart `json:"parts"`
+}
+
+type GeminiPart struct {
+	Text       string      `json:"text,omitempty"`
+	InlineData *InlineData `json:"inline_data,omitempty"`
+}
+
+type InlineData struct {
+	MimeType string `json:"mime_type"`
+	Data     string `json:"data"`
+}
+
+type GeminiResponse struct {
+	Candidates []GeminiCandidate `json:"candidates"`
+}
+
+type GeminiCandidate struct {
+	Content GeminiContent `json:"content"`
+}
+
+func (b *Bot) getGeminiTextResponse(prompt string) (string, error) {
+	requestBody, err := json.Marshal(GeminiRequest{
+		Contents: []GeminiContent{
+			{
+				Parts: []GeminiPart{
+					{Text: prompt},
+				},
+			},
+		},
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to create Gemini request: %w", err)
+	}
+
+	url := "https://generativelanguage.googleapis.com/v1beta/models/" + b.config.GeminiModel + ":generateContent?key=" + b.config.GeminiAPIKey
+
+	req, err := http.NewRequest("POST", url, bytes.NewBuffer(requestBody))
+	if err != nil {
+		return "", fmt.Errorf("failed to create http request: %w", err)
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("failed to send request to Gemini: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("Gemini API returned non-200 status code: %d %s", resp.StatusCode, string(body))
+	}
+
+	var geminiResponse GeminiResponse
+	if err := json.NewDecoder(resp.Body).Decode(&geminiResponse); err != nil {
+		return "", fmt.Errorf("failed to decode Gemini response: %w", err)
+	}
+
+	if len(geminiResponse.Candidates) > 0 && len(geminiResponse.Candidates[0].Content.Parts) > 0 {
+		return geminiResponse.Candidates[0].Content.Parts[0].Text, nil
+	}
+
+	return "Sorry, I couldn't come up with a response.", nil
+}
+
+func (b *Bot) getGeminiVisionResponse(prompt string, imageBytes []byte) (string, error) {
+	// Base64 encode the image
+	encodedImage := base64.StdEncoding.EncodeToString(imageBytes)
+
+	requestBody, err := json.Marshal(GeminiRequest{
+		Contents: []GeminiContent{
+			{
+				Parts: []GeminiPart{
+					{
+						InlineData: &InlineData{
+							MimeType: "image/png",
+							Data:     encodedImage,
+						},
+					},
+					{Text: prompt},
+				},
+			},
+		},
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to create Gemini vision request: %w", err)
+	}
+
+	url := "https://generativelanguage.googleapis.com/v1beta/models/" + b.config.GeminiModel + ":generateContent?key=" + b.config.GeminiAPIKey
+
+	req, err := http.NewRequest("POST", url, bytes.NewBuffer(requestBody))
+	if err != nil {
+		return "", fmt.Errorf("failed to create http request: %w", err)
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 60 * time.Second} // Increased timeout for image uploads
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("failed to send request to Gemini: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("Gemini API returned non-200 status code: %d %s", resp.StatusCode, string(body))
+	}
+
+	var geminiResponse GeminiResponse
+	if err := json.NewDecoder(resp.Body).Decode(&geminiResponse); err != nil {
+		return "", fmt.Errorf("failed to decode Gemini response: %w", err)
+	}
+
+	if len(geminiResponse.Candidates) > 0 && len(geminiResponse.Candidates[0].Content.Parts) > 0 {
+		return geminiResponse.Candidates[0].Content.Parts[0].Text, nil
+	}
+
+	return "Sorry, I couldn't come up with a response.", nil
+}
+
 func loadConfig(path string) (*Config, error) {
 	file, err := ini.Load(path)
 	if err != nil {
@@ -908,6 +1102,9 @@ func loadConfig(path string) (*Config, error) {
 			orSec, _ := cfg.NewSection("OpenRouter")
 			orSec.NewKey("api_key", "your_openrouter_api_key")
 			orSec.NewKey("model", "your_openrouter_model")
+			geminiSec, _ := cfg.NewSection("Gemini")
+			geminiSec.NewKey("api_key", "your_gemini_api_key")
+			geminiSec.NewKey("model", "gemini-1.5-flash-latest")
 			cfg.SaveTo(path)
 			return nil, fmt.Errorf("config.ini not found. A new one was created. Please fill it out.")
 		}
@@ -919,6 +1116,8 @@ func loadConfig(path string) (*Config, error) {
 		OAuthToken:       file.Section("Twitch").Key("oauth_token").String(),
 		OpenRouterAPIKey: file.Section("OpenRouter").Key("api_key").String(),
 		OpenRouterModel:  file.Section("OpenRouter").Key("model").String(),
+		GeminiAPIKey:     file.Section("Gemini").Key("api_key").String(),
+		GeminiModel:      file.Section("Gemini").Key("model").String(),
 	}, nil
 }
 
