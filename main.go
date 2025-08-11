@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
 	"fmt"
@@ -69,13 +70,11 @@ type Bot struct {
 }
 
 type Config struct {
-	BotUsername      string
-	Channel          string
-	OAuthToken       string
-	OpenRouterAPIKey string
-	OpenRouterModel  string
-	GeminiAPIKey     string
-	GeminiModel      string
+	BotUsername  string
+	Channel      string
+	OAuthToken   string
+	GeminiAPIKey string
+	GeminiModel  string
 }
 
 // --- Main Application Logic ---
@@ -132,7 +131,9 @@ func main() {
 		}
 	}()
 
-	log.Println("[INFO] Bot is running. Press Ctrl+C to shut down.")
+	go bot.handleTerminalInput() // Add this line
+
+	log.Println("[INFO] Bot is running. Type commands in here or use Twitch chat. Press Ctrl+C to shut down.")
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 	<-sigChan
@@ -145,7 +146,37 @@ func main() {
 	}
 }
 
-// --- Twitch Command Handling ---
+// --- Terminal & Twitch Command Handling ---
+func (b *Bot) handleTerminalInput() {
+	reader := bufio.NewReader(os.Stdin)
+	for {
+		fmt.Print("> ")
+		text, err := reader.ReadString('\n')
+		if err != nil {
+			if err == io.EOF {
+				return
+			}
+			log.Printf("[ERROR] Could not read from terminal: %v", err)
+			continue
+		}
+		text = strings.TrimSpace(text)
+		if text == "" {
+			continue
+		}
+
+		// Create a mock message to pass to the handler
+		mockMessage := twitch.PrivateMessage{
+			Channel: b.config.Channel,
+			User: twitch.User{
+				Name:        "TerminalUser",
+				DisplayName: "TerminalUser",
+			},
+			Message: text,
+			Tags:    make(map[string]string),
+		}
+		b.handleTwitchMessage(mockMessage)
+	}
+}
 
 func (b *Bot) handleTwitchMessage(message twitch.PrivateMessage) {
 	log.Printf("[CHAT] <%s> %s", message.User.DisplayName, message.Message)
@@ -174,12 +205,6 @@ func (b *Bot) handleTwitchMessage(message twitch.PrivateMessage) {
 				response, err = b.getGeminiTextResponse(prompt)
 				if err != nil {
 					log.Printf("[ERROR] Gemini API error: %v", err)
-					return
-				}
-			} else if b.config.OpenRouterAPIKey != "" && b.config.OpenRouterAPIKey != "your_openrouter_api_key" {
-				response, err = b.getOpenRouterResponse(prompt)
-				if err != nil {
-					log.Printf("[ERROR] OpenRouter API error: %v", err)
 					return
 				}
 			} else {
@@ -778,8 +803,6 @@ func (b *Bot) periodicSaveLoop() {
 	for range ticker.C {
 		if err := b.saveChips(); err != nil {
 			log.Printf("[ERROR] Failed to periodically save chips: %v", err)
-		} else {
-			log.Println("[INFO] User chips saved periodically.")
 		}
 	}
 }
@@ -846,68 +869,6 @@ func getYoutubeInfo(query string) (*YTDLPInfo, error) {
 	return &info, nil
 }
 
-// --- OpenRouter API ---
-
-type OpenRouterRequest struct {
-	Model    string          `json:"model"`
-	Messages []OpenRouterMessage `json:"messages"`
-}
-
-type OpenRouterMessage struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
-}
-
-type OpenRouterResponse struct {
-	Choices []struct {
-		Message struct {
-			Content string `json:"content"`
-		} `json:"message"`
-	} `json:"choices"`
-}
-
-func (b *Bot) getOpenRouterResponse(prompt string) (string, error) {
-	requestBody, err := json.Marshal(OpenRouterRequest{
-		Model: b.config.OpenRouterModel,
-		Messages: []OpenRouterMessage{
-			{Role: "user", Content: prompt},
-		},
-	})
-	if err != nil {
-		return "", fmt.Errorf("failed to create OpenRouter request: %w", err)
-	}
-
-	req, err := http.NewRequest("POST", "https://openrouter.ai/api/v1/chat/completions", bytes.NewBuffer(requestBody))
-	if err != nil {
-		return "", fmt.Errorf("failed to create http request: %w", err)
-	}
-
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+b.config.OpenRouterAPIKey)
-
-	client := &http.Client{Timeout: 30 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("failed to send request to OpenRouter: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("OpenRouter API returned non-200 status code: %d %s", resp.StatusCode, string(body))
-	}
-
-	var openRouterResponse OpenRouterResponse
-	if err := json.NewDecoder(resp.Body).Decode(&openRouterResponse); err != nil {
-		return "", fmt.Errorf("failed to decode OpenRouter response: %w", err)
-	}
-
-	if len(openRouterResponse.Choices) > 0 {
-		return openRouterResponse.Choices[0].Message.Content, nil
-	}
-
-	return "Sorry, I couldn't come up with a response.", nil
-}
 
 // --- Gemini API ---
 
@@ -993,9 +954,6 @@ func loadConfig(path string) (*Config, error) {
 			twitchSec.NewKey("bot_username", "your_bot_name")
 			twitchSec.NewKey("channel", "your_channel_name")
 			twitchSec.NewKey("oauth_token", "oauth:your_token_here")
-			orSec, _ := cfg.NewSection("OpenRouter")
-			orSec.NewKey("api_key", "your_openrouter_api_key")
-			orSec.NewKey("model", "your_openrouter_model")
 			geminiSec, _ := cfg.NewSection("Gemini")
 			geminiSec.NewKey("api_key", "your_gemini_api_key")
 			geminiSec.NewKey("model", "gemini-1.5-flash-latest")
@@ -1005,13 +963,11 @@ func loadConfig(path string) (*Config, error) {
 		return nil, fmt.Errorf("failed to read config file: %w", err)
 	}
 	return &Config{
-		BotUsername:      file.Section("Twitch").Key("bot_username").String(),
-		Channel:          file.Section("Twitch").Key("channel").String(),
-		OAuthToken:       file.Section("Twitch").Key("oauth_token").String(),
-		OpenRouterAPIKey: file.Section("OpenRouter").Key("api_key").String(),
-		OpenRouterModel:  file.Section("OpenRouter").Key("model").String(),
-		GeminiAPIKey:     file.Section("Gemini").Key("api_key").String(),
-		GeminiModel:      file.Section("Gemini").Key("model").String(),
+		BotUsername: file.Section("Twitch").Key("bot_username").String(),
+		Channel:     file.Section("Twitch").Key("channel").String(),
+		OAuthToken:  file.Section("Twitch").Key("oauth_token").String(),
+		GeminiAPIKey: file.Section("Gemini").Key("api_key").String(),
+		GeminiModel: file.Section("Gemini").Key("model").String(),
 	}, nil
 }
 
