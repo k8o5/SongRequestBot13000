@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -27,6 +28,7 @@ import (
 // --- Configuration & State ---
 
 const chipsFile = "user_chips.json"
+const maxSongDuration = 900 // 15 minutes in seconds
 
 type Song struct {
 	ID       string
@@ -54,6 +56,7 @@ type Bot struct {
 	queueMutex        sync.Mutex
 	songQueue         []Song
 	playerCmd         *exec.Cmd
+	nowPlayingID      string
 	downloadDir       string
 	cleanupInterval   time.Duration
 	chipsMutex        sync.Mutex
@@ -532,41 +535,68 @@ func (b *Bot) handleAdd(message twitch.PrivateMessage) {
 		return
 	}
 	query := strings.Join(parts[1:], " ")
-	ytPattern := regexp.MustCompile(`(https?://)?(www\.)?(youtube|youtu|youtube-nocookie)\.(com|be)/.+`)
-	if !ytPattern.MatchString(query) {
-		query = "ytsearch:" + query
-	}
+
 	go func() {
 		info, err := getYoutubeInfo(query)
 		if err != nil {
-			log.Printf("[ERROR] Could not get video info: %v", err)
-			b.twitchClient.Say(b.config.Channel, "Error: Could not find a video for that request.")
+			log.Printf("[VALIDATION] Failed for query \"%s\": %v", query, err)
+			// Send the specific error message from validation (e.g., "video is too long") to the user.
+			b.twitchClient.Say(b.config.Channel, fmt.Sprintf("Error: %v", err))
 			return
 		}
+
 		b.queueMutex.Lock()
 		defer b.queueMutex.Unlock()
-		if len(info.Entries) > 0 {
-			if strings.HasPrefix(query, "ytsearch:") {
-				entry := info.Entries[0]
-				songToAdd := Song{ID: entry.ID, URL: entry.URL, Title: entry.Title, FilePath: ""}
-				b.songQueue = append(b.songQueue, songToAdd)
-				b.twitchClient.Say(b.config.Channel, fmt.Sprintf(`Song "%s" added! Position: %d`, songToAdd.Title, len(b.songQueue)))
-			} else {
-				count := 0
-				for i, entry := range info.Entries {
-					if i >= 10 {
+
+		// Handle playlists
+		if info.Type == "playlist" && len(info.Entries) > 0 {
+			count := 0
+			limit := 10 // Limit how many songs can be added from a playlist at once.
+			for _, entry := range info.Entries {
+				if count >= limit {
+					break
+				}
+				// Basic duplicate check for playlists
+				isDuplicate := false
+				if b.nowPlayingID == entry.ID {
+					isDuplicate = true
+				}
+				for _, queuedSong := range b.songQueue {
+					if queuedSong.ID == entry.ID {
+						isDuplicate = true
 						break
 					}
+				}
+				if !isDuplicate {
 					b.songQueue = append(b.songQueue, Song{ID: entry.ID, URL: entry.URL, Title: entry.Title, FilePath: ""})
 					count++
 				}
-				b.twitchClient.Say(b.config.Channel, fmt.Sprintf(`Playlist "%s" added with %d songs!`, info.Title, count))
 			}
-		} else {
-			songToAdd := Song{ID: info.ID, URL: info.URL, Title: info.Title, FilePath: ""}
-			b.songQueue = append(b.songQueue, songToAdd)
-			b.twitchClient.Say(b.config.Channel, fmt.Sprintf(`Song "%s" added! Position: %d`, songToAdd.Title, len(b.songQueue)))
+			msg := fmt.Sprintf(`Added %d songs from playlist "%s"`, count, info.Title)
+			if len(info.Entries) > limit {
+				msg += fmt.Sprintf(" (limited to first %d).", limit)
+			}
+			b.twitchClient.Say(b.config.Channel, msg)
+			return
 		}
+
+		// Handle single videos
+		// Check for duplicates in the queue or currently playing song.
+		if b.nowPlayingID == info.ID {
+			b.twitchClient.Say(b.config.Channel, fmt.Sprintf(`Song "%s" is currently playing.`, info.Title))
+			return
+		}
+		for _, song := range b.songQueue {
+			if song.ID == info.ID {
+				b.twitchClient.Say(b.config.Channel, fmt.Sprintf(`Song "%s" is already in the queue.`, info.Title))
+				return
+			}
+		}
+
+		// Add the validated song to the queue.
+		songToAdd := Song{ID: info.ID, URL: info.URL, Title: info.Title, FilePath: ""}
+		b.songQueue = append(b.songQueue, songToAdd)
+		b.twitchClient.Say(b.config.Channel, fmt.Sprintf(`Song "%s" added! Position: %d`, songToAdd.Title, len(b.songQueue)))
 	}()
 }
 
@@ -626,35 +656,67 @@ func (b *Bot) downloaderLoop() {
 		var songToDownload *Song
 		b.queueMutex.Lock()
 		for i := range b.songQueue {
+			// Find the first song in the queue that hasn't been downloaded yet.
 			if b.songQueue[i].FilePath == "" {
 				songToDownload = &b.songQueue[i]
 				break
 			}
 		}
 		b.queueMutex.Unlock()
+
 		if songToDownload != nil {
-			log.Printf("[DOWNLOADER] Found song to download: \"%s\"", songToDownload.Title)
+			log.Printf("[DOWNLOADER] Attempting to download: \"%s\"", songToDownload.Title)
 			filenameTemplate := filepath.Join(b.downloadDir, "%(id)s.%(ext)s")
-			downloadCmd := exec.Command("nice", "-n", "19", "yt-dlp", "-f", "bestaudio", "-o", filenameTemplate, songToDownload.URL)
-			if err := downloadCmd.Run(); err != nil {
+
+			// Create a context with a 2-minute timeout.
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+			downloadCmd := exec.CommandContext(ctx, "nice", "-n", "19", "yt-dlp", "-f", "bestaudio", "-o", filenameTemplate, songToDownload.URL)
+
+			// Run the download command.
+			err := downloadCmd.Run()
+			cancel() // Always call cancel to release the context resources.
+
+			if err != nil {
+				// If an error occurs, remove the song from the queue.
 				log.Printf("[ERROR] Failed to download \"%s\": %v", songToDownload.Title, err)
+				if ctx.Err() == context.DeadlineExceeded {
+					b.twitchClient.Say(b.config.Channel, fmt.Sprintf("Error: Download for '%s' took longer than 2 minutes and was cancelled.", songToDownload.Title))
+				} else {
+					b.twitchClient.Say(b.config.Channel, fmt.Sprintf("Error: Could not download '%s'.", songToDownload.Title))
+				}
+
+				// Remove the failed song from the queue.
+				b.queueMutex.Lock()
+				newQueue := make([]Song, 0, len(b.songQueue))
+				for _, song := range b.songQueue {
+					if song.ID != songToDownload.ID {
+						newQueue = append(newQueue, song)
+					}
+				}
+				b.songQueue = newQueue
+				b.queueMutex.Unlock()
 			} else {
+				// If download is successful, get the exact filename.
 				getFilenameCmd := exec.Command("yt-dlp", "--get-filename", "-f", "bestaudio", "-o", filenameTemplate, songToDownload.URL)
 				output, err := getFilenameCmd.Output()
 				if err != nil {
-					log.Printf("[ERROR] Could not determine filename for \"%s\": %v", songToDownload.Title, err)
-					continue
-				}
-				actualFilename := strings.TrimSpace(string(output))
-				log.Printf("[DOWNLOADER] Finished download for: \"%s\" -> %s", songToDownload.Title, actualFilename)
-				b.queueMutex.Lock()
-				for i := range b.songQueue {
-					if b.songQueue[i].ID == songToDownload.ID {
-						b.songQueue[i].FilePath = actualFilename
-						break
+					log.Printf("[ERROR] Could not determine filename for \"%s\" after download: %v", songToDownload.Title, err)
+					// Even if we can't get the filename, the file is downloaded, but we can't play it.
+					// It will be cleaned up later by the cleanupLoop.
+				} else {
+					actualFilename := strings.TrimSpace(string(output))
+					log.Printf("[DOWNLOADER] Finished download for: \"%s\" -> %s", songToDownload.Title, actualFilename)
+
+					// Update the song in the queue with its new file path.
+					b.queueMutex.Lock()
+					for i := range b.songQueue {
+						if b.songQueue[i].ID == songToDownload.ID {
+							b.songQueue[i].FilePath = actualFilename
+							break
+						}
 					}
+					b.queueMutex.Unlock()
 				}
-				b.queueMutex.Unlock()
 			}
 		}
 		time.Sleep(2 * time.Second)
@@ -664,14 +726,19 @@ func (b *Bot) playerLoop() {
 	for {
 		var songToPlay *Song
 		b.queueMutex.Lock()
-		if len(b.songQueue) > 0 && b.songQueue[0].FilePath != "" {
+		// Play a song if nothing is currently playing and the first song in the queue is downloaded.
+		if b.playerCmd == nil && len(b.songQueue) > 0 && b.songQueue[0].FilePath != "" {
 			songToPlay = &b.songQueue[0]
+			b.nowPlayingID = songToPlay.ID
 			b.songQueue = b.songQueue[1:]
 		}
 		b.queueMutex.Unlock()
+
 		if songToPlay != nil {
 			log.Printf("[PLAYER] Found ready song to play: \"%s\"", songToPlay.Title)
 			b.playFile(*songToPlay)
+			// Clear the nowPlayingID after the song finishes.
+			b.nowPlayingID = ""
 		}
 		time.Sleep(1 * time.Second)
 	}
@@ -836,11 +903,13 @@ func (b *Bot) loadChips() error {
 }
 
 type YTDLPInfo struct {
-	Type    string `json:"_type"`
-	ID      string `json:"id"`
-	Title   string `json:"title"`
-	URL     string `json:"webpage_url"`
-	Entries []struct {
+	Type     string  `json:"_type"`
+	ID       string  `json:"id"`
+	Title    string  `json:"title"`
+	URL      string  `json:"webpage_url"`
+	Duration float64 `json:"duration"`
+	IsLive   bool    `json:"is_live"`
+	Entries  []struct {
 		ID    string `json:"id"`
 		Title string `json:"title"`
 		URL   string `json:"url"`
@@ -848,24 +917,46 @@ type YTDLPInfo struct {
 }
 
 func getYoutubeInfo(query string) (*YTDLPInfo, error) {
-	cmd := exec.Command("yt-dlp", "--quiet", "--dump-single-json", "--flat-playlist", query)
+	// We use --dump-single-json to get detailed info, including duration.
+	// We use --default-search "ytsearch" to allow for search terms.
+	// yt-dlp is smart enough to handle single videos, playlists, and search queries with this command.
+	cmd := exec.Command("yt-dlp", "--quiet", "--dump-single-json", "--default-search", "ytsearch", query)
 	output, err := cmd.Output()
 	if err != nil {
-		return nil, fmt.Errorf("yt-dlp execution failed: %w", err)
+		// This can happen if yt-dlp fails to find a video or another network error occurs.
+		return nil, fmt.Errorf("could not find a video for that request")
 	}
+
 	var info YTDLPInfo
 	if err := json.Unmarshal(output, &info); err != nil {
-		return nil, fmt.Errorf("failed to parse yt-dlp JSON: %w", err)
+		return nil, fmt.Errorf("failed to parse video data from yt-dlp: %w", err)
 	}
-	if info.Type == "playlist" && len(info.Entries) > 0 {
+
+	// If it's a playlist, yt-dlp returns a _type of "playlist".
+	// We will not validate individual songs in a playlist to avoid long delays.
+	if info.Type == "playlist" {
+		// Populate URLs for playlist entries if they are missing
 		for i := range info.Entries {
 			if info.Entries[i].URL == "" {
 				info.Entries[i].URL = fmt.Sprintf("https://www.youtube.com/watch?v=%s", info.Entries[i].ID)
 			}
 		}
-	} else if info.URL == "" && info.ID != "" {
+		return &info, nil
+	}
+
+	// For single videos, perform the validation checks.
+	if info.IsLive {
+		return nil, fmt.Errorf("cannot add live videos")
+	}
+	if info.Duration > maxSongDuration {
+		return nil, fmt.Errorf("video is longer than 15 minutes")
+	}
+
+	// Ensure the URL is populated for single videos.
+	if info.URL == "" && info.ID != "" {
 		info.URL = fmt.Sprintf("https://www.youtube.com/watch?v=%s", info.ID)
 	}
+
 	return &info, nil
 }
 
