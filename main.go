@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -535,11 +536,18 @@ func (b *Bot) handleAdd(message twitch.PrivateMessage) {
 	}
 	query := strings.Join(parts[1:], " ")
 
+	// Check if the query is a URL or a search term.
+	isSearch := false
+	ytPattern := regexp.MustCompile(`(https?://)?(www\.)?(youtube|youtu|youtube-nocookie)\.(com|be)/.+`)
+	if !ytPattern.MatchString(query) {
+		isSearch = true
+		query = "ytsearch:" + query
+	}
+
 	go func() {
 		info, err := getYoutubeInfo(query)
 		if err != nil {
 			log.Printf("[VALIDATION] Failed for query \"%s\": %v", query, err)
-			// Send the specific error message from validation (e.g., "video is too long") to the user.
 			b.twitchClient.Say(b.config.Channel, fmt.Sprintf("Error: %v", err))
 			return
 		}
@@ -547,55 +555,69 @@ func (b *Bot) handleAdd(message twitch.PrivateMessage) {
 		b.queueMutex.Lock()
 		defer b.queueMutex.Unlock()
 
-		// Handle playlists
-		if info.Type == "playlist" && len(info.Entries) > 0 {
-			count := 0
-			limit := 10 // Limit how many songs can be added from a playlist at once.
-			for _, entry := range info.Entries {
-				if count >= limit {
-					break
-				}
-				// Basic duplicate check for playlists
-				isDuplicate := false
-				if b.nowPlayingID == entry.ID {
-					isDuplicate = true
-				}
-				for _, queuedSong := range b.songQueue {
-					if queuedSong.ID == entry.ID {
-						isDuplicate = true
+		// This is the logic that correctly handles search results vs. playlists.
+		var songsToAdd []Song
+		if isSearch {
+			// If it was a search, we only want the first result, even if yt-dlp gives us a playlist.
+			if len(info.Entries) > 0 {
+				firstEntry := info.Entries[0]
+				songsToAdd = append(songsToAdd, Song{ID: firstEntry.ID, URL: firstEntry.URL, Title: firstEntry.Title})
+			} else {
+				// It might be a direct video result from a search.
+				songsToAdd = append(songsToAdd, Song{ID: info.ID, URL: info.URL, Title: info.Title})
+			}
+		} else {
+			// If it was a URL, check if it's a playlist.
+			if info.Type == "playlist" && len(info.Entries) > 0 {
+				limit := 10
+				for i, entry := range info.Entries {
+					if i >= limit {
 						break
 					}
+					songsToAdd = append(songsToAdd, Song{ID: entry.ID, URL: entry.URL, Title: entry.Title})
 				}
-				if !isDuplicate {
-					b.songQueue = append(b.songQueue, Song{ID: entry.ID, URL: entry.URL, Title: entry.Title, FilePath: ""})
-					count++
-				}
-			}
-			msg := fmt.Sprintf(`Added %d songs from playlist "%s"`, count, info.Title)
-			if len(info.Entries) > limit {
-				msg += fmt.Sprintf(" (limited to first %d).", limit)
-			}
-			b.twitchClient.Say(b.config.Channel, msg)
-			return
-		}
-
-		// Handle single videos
-		// Check for duplicates in the queue or currently playing song.
-		if b.nowPlayingID == info.ID {
-			b.twitchClient.Say(b.config.Channel, fmt.Sprintf(`Song "%s" is currently playing.`, info.Title))
-			return
-		}
-		for _, song := range b.songQueue {
-			if song.ID == info.ID {
-				b.twitchClient.Say(b.config.Channel, fmt.Sprintf(`Song "%s" is already in the queue.`, info.Title))
-				return
+				b.twitchClient.Say(b.config.Channel, fmt.Sprintf(`Adding %d songs from playlist "%s" (limit %d).`, len(songsToAdd), info.Title, limit))
+			} else {
+				// It was a single video URL.
+				songsToAdd = append(songsToAdd, Song{ID: info.ID, URL: info.URL, Title: info.Title})
 			}
 		}
 
-		// Add the validated song to the queue.
-		songToAdd := Song{ID: info.ID, URL: info.URL, Title: info.Title, FilePath: ""}
-		b.songQueue = append(b.songQueue, songToAdd)
-		b.twitchClient.Say(b.config.Channel, fmt.Sprintf(`Song "%s" added! Position: %d`, songToAdd.Title, len(b.songQueue)))
+		if len(songsToAdd) == 0 {
+			b.twitchClient.Say(b.config.Channel, "Could not find any songs to add from that query.")
+			return
+		}
+
+		// Now, validate and add the songs.
+		addedCount := 0
+		for _, song := range songsToAdd {
+			// Check for duplicates.
+			if b.nowPlayingID == song.ID {
+				continue // Skip currently playing song
+			}
+			isDuplicateInQueue := false
+			for _, queuedSong := range b.songQueue {
+				if queuedSong.ID == song.ID {
+					isDuplicateInQueue = true
+					break
+				}
+			}
+			if isDuplicateInQueue {
+				continue // Skip song already in queue
+			}
+
+			// Add the song.
+			b.songQueue = append(b.songQueue, song)
+			addedCount++
+		}
+
+		if len(songsToAdd) == 1 && addedCount == 1 {
+			b.twitchClient.Say(b.config.Channel, fmt.Sprintf(`Song "%s" added! Position: %d`, songsToAdd[0].Title, len(b.songQueue)))
+		} else if addedCount > 0 {
+			b.twitchClient.Say(b.config.Channel, fmt.Sprintf("Added %d new songs to the queue.", addedCount))
+		} else {
+			b.twitchClient.Say(b.config.Channel, "All songs from that query were already in the queue or are currently playing.")
+		}
 	}()
 }
 
@@ -916,10 +938,8 @@ type YTDLPInfo struct {
 }
 
 func getYoutubeInfo(query string) (*YTDLPInfo, error) {
-	// We use --dump-single-json to get detailed info, including duration.
-	// We use --default-search "ytsearch" to allow for search terms.
-	// yt-dlp is smart enough to handle single videos, playlists, and search queries with this command.
-	cmd := exec.Command("yt-dlp", "--quiet", "--dump-single-json", "--default-search", "ytsearch", query)
+	// Note: The caller is now responsible for specifying "ytsearch:" for searches.
+	cmd := exec.Command("yt-dlp", "--quiet", "--dump-single-json", query)
 	output, err := cmd.Output()
 	if err != nil {
 		// This can happen if yt-dlp fails to find a video or another network error occurs.
