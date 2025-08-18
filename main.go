@@ -22,159 +22,8 @@ import (
 	"time"
 
 	"github.com/gempir/go-twitch-irc/v4"
-	"github.com/gorilla/websocket"
 	"gopkg.in/ini.v1"
 )
-
-// --- Embedded HTML Overlay ---
-
-const overlayHTML = `
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Bot Overlay</title>
-    <style>
-        body {
-            background-color: transparent;
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            color: white;
-            text-shadow: 2px 2px 4px #000000;
-            margin: 0;
-            padding: 20px;
-            overflow: hidden;
-        }
-        #overlay-container {
-            position: relative;
-            width: 100vw;
-            height: 100vh;
-        }
-        #bot-container {
-            position: absolute;
-            bottom: 20px;
-            left: 20px;
-            display: flex;
-            align-items: flex-end;
-        }
-        #avatar {
-            width: 150px;
-            height: 150px;
-            border-radius: 50%;
-            border: 3px solid #6441a5; /* Twitch purple */
-        }
-        #speech-bubble {
-            position: relative;
-            background: rgba(45, 45, 45, 0.9);
-            border-radius: .4em;
-            padding: 1em;
-            margin-left: 20px;
-            max-width: 400px;
-            opacity: 0;
-            transition: opacity 0.5s ease-in-out;
-        }
-        #speech-bubble.visible {
-            opacity: 1;
-        }
-        #speech-bubble:after {
-            content: '';
-            position: absolute;
-            left: 0;
-            bottom: 20px;
-            width: 0;
-            height: 0;
-            border: 20px solid transparent;
-            border-right-color: rgba(45, 45, 45, 0.9);
-            border-left: 0;
-            border-bottom: 0;
-            margin-top: -10px;
-            margin-left: -20px;
-        }
-        #speech-text {
-            margin: 0;
-            padding: 0;
-            font-size: 1.2em;
-        }
-        #now-playing-container {
-            position: absolute;
-            bottom: 20px;
-            right: 20px;
-            background: rgba(45, 45, 45, 0.8);
-            padding: 10px 20px;
-            border-radius: 10px;
-            font-size: 1.1em;
-        }
-    </style>
-</head>
-<body>
-    <div id="overlay-container">
-        <div id="bot-container">
-            <img id="avatar" src="https://cdn.pixabay.com/photo/2017/09/01/13/46/robot-2703986_960_720.png" alt="Bot Avatar">
-            <div id="speech-bubble">
-                <p id="speech-text">Hello, world!</p>
-            </div>
-        </div>
-        <div id="now-playing-container">
-            Now Playing: <span id="song-title">Nothing yet...</span>
-        </div>
-    </div>
-    <script>
-        (function() {
-            const songTitleEl = document.getElementById('song-title');
-            const speechBubbleEl = document.getElementById('speech-bubble');
-            const speechTextEl = document.getElementById('speech-text');
-            let socket;
-            let speechTimeout;
-            function connect() {
-                const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-                const host = window.location.host;
-                socket = new WebSocket(protocol + '//' + host + '/ws');
-                socket.onopen = function(e) { console.log("[WebSocket] Connection established"); };
-                socket.onmessage = function(event) {
-                    try {
-                        const message = JSON.parse(event.data);
-                        handleMessage(message);
-                    } catch (error) {
-                        console.error("[WebSocket] Error parsing message:", error);
-                    }
-                };
-                socket.onclose = function(event) {
-                    console.log("[WebSocket] Connection closed. Reconnecting in 3 seconds...");
-                    setTimeout(connect, 3000);
-                };
-                socket.onerror = function(error) {
-                    console.error('[WebSocket] Error: ' + error.message);
-                    socket.close();
-                };
-            }
-            function handleMessage(message) {
-                switch (message.type) {
-                    case 'now_playing':
-                        songTitleEl.textContent = message.payload.title;
-                        break;
-                    case 'speech':
-                        handleSpeech(message.payload.text);
-                        break;
-                    default:
-                        console.warn("Unknown message type:", message.type);
-                }
-            }
-            function handleSpeech(text) {
-                if (speechTimeout) {
-                    clearTimeout(speechTimeout);
-                }
-                speechTextEl.textContent = text;
-                speechBubbleEl.classList.add('visible');
-                speechTimeout = setTimeout(() => {
-                    speechBubbleEl.classList.remove('visible');
-                }, 8000);
-            }
-            connect();
-        })();
-    </script>
-</body>
-</html>
-`
 
 // --- Configuration & State ---
 
@@ -202,7 +51,6 @@ type BlackjackGame struct {
 }
 
 type Bot struct {
-	hub               *Hub
 	config            *Config
 	twitchClient      *twitch.Client
 	queueMutex        sync.Mutex
@@ -212,13 +60,13 @@ type Bot struct {
 	downloadDir       string
 	cleanupInterval   time.Duration
 	chipsMutex        sync.Mutex
-	userChips         map[string]int64
+	userChips         map[string]int64 // NOTE: Key is now lowercase username
 	freeChipsMutex    sync.Mutex
-	lastFreeChips     map[string]time.Time
+	lastFreeChips     map[string]time.Time // Key is lowercase username
 	freeChipsCooldown time.Duration
 	freeChipsAmount   int64
 	blackjackMutex    sync.Mutex
-	blackjackGames    map[string]*BlackjackGame
+	blackjackGames    map[string]*BlackjackGame // Key is lowercase username
 	ttsEnabled        bool
 	ttsMutex          sync.Mutex
 	ttsPlaybackMutex  sync.Mutex
@@ -230,29 +78,6 @@ type Config struct {
 	OAuthToken   string
 	GeminiAPIKey string
 	GeminiModel  string
-}
-
-// --- WebSocket Structs ---
-
-type Hub struct {
-	clients    map[*websocket.Conn]bool
-	broadcast  chan []byte
-	register   chan *websocket.Conn
-	unregister chan *websocket.Conn
-	mutex      sync.Mutex
-}
-
-type WebSocketMessage struct {
-	Type    string      `json:"type"`
-	Payload interface{} `json:"payload"`
-}
-
-type NowPlayingPayload struct {
-	Title string `json:"title"`
-}
-
-type SpeechPayload struct {
-	Text string `json:"text"`
 }
 
 // --- Main Application Logic ---
@@ -288,13 +113,10 @@ func main() {
 		log.Printf("[WARN] Could not load user chips, starting fresh: %v", err)
 	}
 
-	bot.hub = newHub()
-
 	go bot.downloaderLoop()
 	go bot.playerLoop()
 	go bot.cleanupLoop()
 	go bot.periodicSaveLoop()
-	go startWebServer(bot.hub)
 
 	bot.twitchClient = twitch.NewClient(cfg.BotUsername, cfg.OAuthToken)
 	bot.twitchClient.OnPrivateMessage(bot.handleTwitchMessage)
@@ -312,7 +134,7 @@ func main() {
 		}
 	}()
 
-	go bot.handleTerminalInput()
+	go bot.handleTerminalInput() // Add this line
 
 	log.Println("[INFO] Bot is running. Type commands in here or use Twitch chat. Press Ctrl+C to shut down.")
 	sigChan := make(chan os.Signal, 1)
@@ -327,85 +149,7 @@ func main() {
 	}
 }
 
-// --- Web Server Logic ---
-
-func newHub() *Hub {
-	return &Hub{
-		broadcast:  make(chan []byte),
-		register:   make(chan *websocket.Conn),
-		unregister: make(chan *websocket.Conn),
-		clients:    make(map[*websocket.Conn]bool),
-	}
-}
-
-func (h *Hub) run() {
-	for {
-		select {
-		case client := <-h.register:
-			h.mutex.Lock()
-			h.clients[client] = true
-			h.mutex.Unlock()
-			log.Println("[WEBSOCKET] Client registered")
-		case client := <-h.unregister:
-			h.mutex.Lock()
-			if _, ok := h.clients[client]; ok {
-				delete(h.clients, client)
-				client.Close()
-				log.Println("[WEBSOCKET] Client unregistered")
-			}
-			h.mutex.Unlock()
-		case message := <-h.broadcast:
-			h.mutex.Lock()
-			for client := range h.clients {
-				err := client.WriteMessage(websocket.TextMessage, message)
-				if err != nil {
-					log.Printf("[ERROR] WebSocket write error: %v", err)
-					client.Close()
-					delete(h.clients, client)
-				}
-			}
-			h.mutex.Unlock()
-		}
-	}
-}
-
-var upgrader = websocket.Upgrader{
-	ReadBufferSize:  1024,
-	WriteBufferSize: 1024,
-	CheckOrigin: func(r *http.Request) bool {
-		return true
-	},
-}
-
-func serveWs(hub *Hub, w http.ResponseWriter, r *http.Request) {
-	conn, err := upgrader.Upgrade(w, r, nil)
-	if err != nil {
-		log.Println(err)
-		return
-	}
-	hub.register <- conn
-}
-
-func startWebServer(hub *Hub) {
-	go hub.run()
-
-	http.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
-		serveWs(hub, w, r)
-	})
-
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/html")
-		fmt.Fprint(w, overlayHTML)
-	})
-
-	log.Println("[INFO] Starting web server on :8080")
-	if err := http.ListenAndServe(":8080", nil); err != nil {
-		log.Fatalf("[FATAL] ListenAndServe: %v", err)
-	}
-}
-
 // --- Terminal & Twitch Command Handling ---
-
 func (b *Bot) handleTerminalInput() {
 	reader := bufio.NewReader(os.Stdin)
 	for {
@@ -422,6 +166,8 @@ func (b *Bot) handleTerminalInput() {
 		if text == "" {
 			continue
 		}
+
+		// Create a mock message to pass to the handler
 		mockMessage := twitch.PrivateMessage{
 			Channel: b.config.Channel,
 			User: twitch.User{
@@ -438,98 +184,110 @@ func (b *Bot) handleTerminalInput() {
 func (b *Bot) handleTwitchMessage(message twitch.PrivateMessage) {
 	log.Printf("[CHAT] <%s> %s", message.User.DisplayName, message.Message)
 
-	if strings.EqualFold(message.User.Name, b.config.BotUsername) {
-		return
+	// TTS Handling
+	b.ttsMutex.Lock()
+	isTTSEnabled := b.ttsEnabled
+	b.ttsMutex.Unlock()
+	// Prevent bot from reading its own messages or commands if they are handled elsewhere
+	if isTTSEnabled && strings.ToLower(message.User.Name) != strings.ToLower(b.config.BotUsername) {
+		// We also don't want to read commands/mentions twice.
+		isCommand := strings.HasPrefix(message.Message, "!")
+		isMention := strings.HasPrefix(strings.ToLower(message.Message), strings.ToLower("@"+b.config.BotUsername))
+		if !isCommand && !isMention {
+			go b.handleTTS(message)
+		}
 	}
 
 	botMention := "@" + b.config.BotUsername
 	if strings.HasPrefix(strings.ToLower(message.Message), strings.ToLower(botMention)) {
 		prompt := strings.TrimSpace(strings.TrimPrefix(message.Message, botMention))
-
 		go func() {
-			if b.config.GeminiAPIKey == "" || b.config.GeminiAPIKey == "your_gemini_api_key" {
+			var response string
+			var err error
+			if b.config.GeminiAPIKey != "" && b.config.GeminiAPIKey != "your_gemini_api_key" {
+				response, err = b.getGeminiTextResponse(prompt)
+				if err != nil {
+					log.Printf("[ERROR] Gemini API error: %v", err)
+					return
+				}
+			} else {
+				// No API key configured, so do nothing.
 				return
 			}
-			response, err := b.getGeminiTextResponse(prompt)
-			if err != nil {
-				log.Printf("[ERROR] Gemini API error for overlay: %v", err)
-				return
-			}
-
-			payload := SpeechPayload{Text: response}
-			msg, _ := json.Marshal(WebSocketMessage{Type: "speech", Payload: payload})
-			b.hub.broadcast <- msg
+			b.twitchClient.Say(b.config.Channel, response)
 		}()
+		return // Don't process as a command if it's a mention
+	}
+
+	if !strings.HasPrefix(message.Message, "!") {
 		return
 	}
 
-	if strings.HasPrefix(message.Message, "!") {
-		parts := strings.Fields(message.Message)
-		command := strings.ToLower(parts[0])
-		switch command {
-		case "!add":
-			b.handleAdd(message)
-		case "!queue":
-			b.handleShowQueue()
-		case "!skip":
-			b.handleSkip(message)
-		case "!clear":
-			b.handleClearQueue(message)
-		case "!bj", "!blackjack":
-			b.handleBlackjack(message)
-		case "!hit":
-			b.handleHit(message)
-		case "!stand":
-			b.handleStand(message)
-		case "!chips":
-			b.handleChips(message)
-		case "!freechips":
-			b.handleFreeChips(message)
-		case "!pay":
-			b.handlePay(message)
-		case "!femboy":
-			b.handleFemboy(message)
-		case "!help":
-			b.handleHelp(message)
-		case "!tts":
-			b.handleTtsToggle(message)
-		}
-		return
+	parts := strings.Fields(message.Message)
+	command := strings.ToLower(parts[0])
+	switch command {
+	// Music Commands
+	case "!add":
+		b.handleAdd(message)
+	case "!queue":
+		b.handleShowQueue()
+	case "!skip":
+		b.handleSkip(message)
+	case "!clear":
+		b.handleClearQueue(message)
+	// Chip/Game Commands
+	case "!bj", "!blackjack":
+		b.handleBlackjack(message)
+	case "!hit":
+		b.handleHit(message)
+	case "!stand":
+		b.handleStand(message)
+	case "!chips":
+		b.handleChips(message)
+	case "!freechips":
+		b.handleFreeChips(message)
+	case "!pay":
+		b.handlePay(message)
+	// Misc Commands
+	case "!femboy":
+		b.handleFemboy(message)
+	case "!help":
+		b.handleHelp(message)
+	case "!tts":
+		b.handleTtsToggle(message)
 	}
-
-	b.ttsMutex.Lock()
-	isTTSEnabled := b.ttsEnabled
-	b.ttsMutex.Unlock()
-	if isTTSEnabled {
-		go b.handleTTS(message)
-	}
-
-	fullText := fmt.Sprintf("%s: %s", message.User.DisplayName, message.Message)
-	payload := SpeechPayload{Text: fullText}
-	msg, _ := json.Marshal(WebSocketMessage{Type: "speech", Payload: payload})
-	b.hub.broadcast <- msg
 }
 
 func (b *Bot) handleTTS(message twitch.PrivateMessage) {
 	b.ttsPlaybackMutex.Lock()
 	defer b.ttsPlaybackMutex.Unlock()
+
 	textToSpeak := fmt.Sprintf("%s says %s", message.User.DisplayName, message.Message)
+
+	// Create a temporary file for the WAV output
 	tmpfile, err := os.CreateTemp(b.downloadDir, "tts-*.wav")
 	if err != nil {
 		log.Printf("[ERROR] TTS: Could not create temp file: %v", err)
 		return
 	}
-	defer os.Remove(tmpfile.Name())
+	defer os.Remove(tmpfile.Name()) // Clean up the file afterwards
 	tmpfileName := tmpfile.Name()
-	tmpfile.Close()
+	tmpfile.Close() // Close the file so espeak can write to it
+
+	// Generate TTS audio using espeak
+	// Using exec.Command with separate arguments prevents command injection
 	espeakCmd := exec.Command("espeak", "-w", tmpfileName, textToSpeak)
 	if err := espeakCmd.Run(); err != nil {
 		log.Printf("[ERROR] TTS: espeak command failed: %v", err)
+		// Try to inform the user in chat if espeak is likely not installed.
 		if strings.Contains(err.Error(), "executable file not found") {
 			log.Println("[WARN] TTS: 'espeak' command not found. Please install it to use TTS.")
+			// b.twitchClient.Say(b.config.Channel, "TTS is enabled, but the 'espeak' command is not installed on the server.")
 		}
 		return
 	}
+
+	// Play the generated audio file with ffplay
 	ffplayCmd := exec.Command("ffplay", "-nodisp", "-autoexit", "-loglevel", "error", tmpfileName)
 	if err := ffplayCmd.Run(); err != nil {
 		log.Printf("[ERROR] TTS: ffplay command failed: %v", err)
@@ -542,10 +300,12 @@ func (b *Bot) handleTtsToggle(message twitch.PrivateMessage) {
 		b.twitchClient.Say(b.config.Channel, "You do not have permission to toggle TTS.")
 		return
 	}
+
 	b.ttsMutex.Lock()
 	b.ttsEnabled = !b.ttsEnabled
 	isEnabled := b.ttsEnabled
 	b.ttsMutex.Unlock()
+
 	if isEnabled {
 		b.twitchClient.Say(b.config.Channel, "TTS has been enabled. Messages starting with ! will be read aloud.")
 	} else {
@@ -561,26 +321,33 @@ func (b *Bot) handlePay(message twitch.PrivateMessage) {
 		b.twitchClient.Say(b.config.Channel, fmt.Sprintf("%s, usage: !pay <username> <amount>", message.User.DisplayName))
 		return
 	}
+
 	payerUsername := strings.ToLower(message.User.Name)
 	payeeUsername := strings.ToLower(strings.TrimPrefix(parts[1], "@"))
+
 	if strings.EqualFold(payerUsername, payeeUsername) {
 		b.twitchClient.Say(b.config.Channel, fmt.Sprintf("%s, you can't pay yourself!", message.User.DisplayName))
 		return
 	}
+
 	amount, err := strconv.ParseInt(parts[2], 10, 64)
 	if err != nil || amount <= 0 {
 		b.twitchClient.Say(b.config.Channel, fmt.Sprintf("%s, please enter a valid positive number to pay.", message.User.DisplayName))
 		return
 	}
+
 	b.chipsMutex.Lock()
 	defer b.chipsMutex.Unlock()
+
 	payerChips := b.userChips[payerUsername]
 	if payerChips < amount {
 		b.twitchClient.Say(b.config.Channel, fmt.Sprintf("%s, you don't have enough chips to pay that amount. You have %d.", message.User.DisplayName, payerChips))
 		return
 	}
+
 	b.userChips[payerUsername] -= amount
 	b.userChips[payeeUsername] += amount
+
 	b.twitchClient.Say(b.config.Channel, fmt.Sprintf("%s paid %s %d chips!", message.User.DisplayName, payeeUsername, amount))
 }
 
@@ -599,6 +366,7 @@ func (b *Bot) handleBlackjack(message twitch.PrivateMessage) {
 		b.twitchClient.Say(b.config.Channel, fmt.Sprintf("%s, the maximum bet is 10,000 chips.", message.User.DisplayName))
 		return
 	}
+
 	username := strings.ToLower(message.User.Name)
 	b.blackjackMutex.Lock()
 	if _, ok := b.blackjackGames[username]; ok {
@@ -607,6 +375,7 @@ func (b *Bot) handleBlackjack(message twitch.PrivateMessage) {
 		return
 	}
 	b.blackjackMutex.Unlock()
+
 	b.chipsMutex.Lock()
 	userChips := b.userChips[username]
 	if userChips < betAmount {
@@ -616,6 +385,7 @@ func (b *Bot) handleBlackjack(message twitch.PrivateMessage) {
 	}
 	b.userChips[username] -= betAmount
 	b.chipsMutex.Unlock()
+
 	deck := newDeck()
 	shuffleDeck(deck)
 	game := &BlackjackGame{PlayerHand: make([]Card, 0), DealerHand: make([]Card, 0), Deck: deck, Bet: betAmount}
@@ -623,17 +393,20 @@ func (b *Bot) handleBlackjack(message twitch.PrivateMessage) {
 	game.DealerHand = append(game.DealerHand, dealCard(&game.Deck))
 	game.PlayerHand = append(game.PlayerHand, dealCard(&game.Deck))
 	game.DealerHand = append(game.DealerHand, dealCard(&game.Deck))
+
 	b.blackjackMutex.Lock()
 	b.blackjackGames[username] = game
 	b.blackjackMutex.Unlock()
+
 	playerValue, _ := calculateHandValue(game.PlayerHand)
 	dealerValue, _ := calculateHandValue(game.DealerHand)
 	playerHandStr := handToString(game.PlayerHand, playerValue)
 	dealerHandStr := fmt.Sprintf("[%s, ?]", game.DealerHand[0].Rank+game.DealerHand[0].Suit)
+
 	if playerValue == 21 {
-		if dealerValue == 21 {
+		if dealerValue == 21 { // Push
 			b.endBlackjackGame(message, "Both you and the dealer have Blackjack! It's a push.", game.Bet)
-		} else {
+		} else { // Player Blackjack
 			payout := game.Bet + (game.Bet * 3 / 2)
 			b.endBlackjackGame(message, fmt.Sprintf("Blackjack! You win %d chips!", payout), payout)
 		}
@@ -644,6 +417,7 @@ func (b *Bot) handleBlackjack(message twitch.PrivateMessage) {
 
 func (b *Bot) handleHit(message twitch.PrivateMessage) {
 	username := strings.ToLower(message.User.Name)
+
 	b.blackjackMutex.Lock()
 	game, ok := b.blackjackGames[username]
 	if !ok {
@@ -652,24 +426,29 @@ func (b *Bot) handleHit(message twitch.PrivateMessage) {
 		return
 	}
 	b.blackjackMutex.Unlock()
+
 	game.PlayerHand = append(game.PlayerHand, dealCard(&game.Deck))
 	playerValue, _ := calculateHandValue(game.PlayerHand)
 	playerHandStr := handToString(game.PlayerHand, playerValue)
+
 	if playerValue > 21 {
 		b.twitchClient.Say(b.config.Channel, fmt.Sprintf("%s busts with %s! You lose %d chips.", message.User.DisplayName, playerHandStr, game.Bet))
-		b.endBlackjackGame(message, "", 0)
+		b.endBlackjackGame(message, "", 0) // End game with 0 payout
 		return
 	}
+
 	if playerValue == 21 {
 		b.twitchClient.Say(b.config.Channel, fmt.Sprintf("%s, your new hand: %s. Automatically standing.", message.User.DisplayName, playerHandStr))
-		b.handleStand(message)
+		b.handleStand(message) // Automatically stand for the player
 		return
 	}
+
 	b.twitchClient.Say(b.config.Channel, fmt.Sprintf("%s, your new hand: %s. !hit or !stand?", message.User.DisplayName, playerHandStr))
 }
 
 func (b *Bot) handleStand(message twitch.PrivateMessage) {
 	username := strings.ToLower(message.User.Name)
+
 	b.blackjackMutex.Lock()
 	game, ok := b.blackjackGames[username]
 	if !ok {
@@ -678,8 +457,10 @@ func (b *Bot) handleStand(message twitch.PrivateMessage) {
 		return
 	}
 	b.blackjackMutex.Unlock()
+
 	playerValue, _ := calculateHandValue(game.PlayerHand)
 	playerHandStr := handToString(game.PlayerHand, playerValue)
+
 	for {
 		dealerValue, _ := calculateHandValue(game.DealerHand)
 		if dealerValue >= 17 {
@@ -687,11 +468,14 @@ func (b *Bot) handleStand(message twitch.PrivateMessage) {
 		}
 		game.DealerHand = append(game.DealerHand, dealCard(&game.Deck))
 	}
+
 	dealerValue, _ := calculateHandValue(game.DealerHand)
 	dealerHandStr := handToString(game.DealerHand, dealerValue)
+
 	resultMsg := fmt.Sprintf("Your hand: %s. Dealer's hand: %s. ", playerHandStr, dealerHandStr)
 	var payout int64
 	var outcome string
+
 	if dealerValue > 21 {
 		payout = game.Bet * 2
 		outcome = fmt.Sprintf("Dealer busts! You win %d chips!", payout)
@@ -707,6 +491,8 @@ func (b *Bot) handleStand(message twitch.PrivateMessage) {
 	}
 	b.endBlackjackGame(message, resultMsg+outcome, payout)
 }
+
+// --- Other Command Handlers ---
 
 func (b *Bot) handleHelp(message twitch.PrivateMessage) {
 	commandList := "!add, !queue, !skip, !clear, !bj, !hit, !stand, !chips, !freechips, !pay, !femboy, !tts, !help"
@@ -733,10 +519,12 @@ func (b *Bot) handleFreeChips(message twitch.PrivateMessage) {
 	}
 	b.lastFreeChips[username] = time.Now()
 	b.freeChipsMutex.Unlock()
+
 	b.chipsMutex.Lock()
 	b.userChips[username] += b.freeChipsAmount
 	newBalance := b.userChips[username]
 	b.chipsMutex.Unlock()
+
 	b.twitchClient.Say(b.config.Channel, fmt.Sprintf("%s, here are %d free chips! Your new balance is %d.", message.User.DisplayName, b.freeChipsAmount, newBalance))
 }
 
@@ -747,12 +535,15 @@ func (b *Bot) handleAdd(message twitch.PrivateMessage) {
 		return
 	}
 	query := strings.Join(parts[1:], " ")
+
+	// Check if the query is a URL or a search term.
 	isSearch := false
 	ytPattern := regexp.MustCompile(`(https?://)?(www\.)?(youtube|youtu|youtube-nocookie)\.(com|be)/.+`)
 	if !ytPattern.MatchString(query) {
 		isSearch = true
 		query = "ytsearch:" + query
 	}
+
 	go func() {
 		info, err := getYoutubeInfo(query)
 		if err != nil {
@@ -760,17 +551,23 @@ func (b *Bot) handleAdd(message twitch.PrivateMessage) {
 			b.twitchClient.Say(b.config.Channel, fmt.Sprintf("Error: %v", err))
 			return
 		}
+
 		b.queueMutex.Lock()
 		defer b.queueMutex.Unlock()
+
+		// This is the logic that correctly handles search results vs. playlists.
 		var songsToAdd []Song
 		if isSearch {
+			// If it was a search, we only want the first result, even if yt-dlp gives us a playlist.
 			if len(info.Entries) > 0 {
 				firstEntry := info.Entries[0]
 				songsToAdd = append(songsToAdd, Song{ID: firstEntry.ID, URL: firstEntry.URL, Title: firstEntry.Title})
 			} else {
+				// It might be a direct video result from a search.
 				songsToAdd = append(songsToAdd, Song{ID: info.ID, URL: info.URL, Title: info.Title})
 			}
 		} else {
+			// If it was a URL, check if it's a playlist.
 			if info.Type == "playlist" && len(info.Entries) > 0 {
 				limit := 10
 				for i, entry := range info.Entries {
@@ -781,17 +578,22 @@ func (b *Bot) handleAdd(message twitch.PrivateMessage) {
 				}
 				b.twitchClient.Say(b.config.Channel, fmt.Sprintf(`Adding %d songs from playlist "%s" (limit %d).`, len(songsToAdd), info.Title, limit))
 			} else {
+				// It was a single video URL.
 				songsToAdd = append(songsToAdd, Song{ID: info.ID, URL: info.URL, Title: info.Title})
 			}
 		}
+
 		if len(songsToAdd) == 0 {
 			b.twitchClient.Say(b.config.Channel, "Could not find any songs to add from that query.")
 			return
 		}
+
+		// Now, validate and add the songs.
 		addedCount := 0
 		for _, song := range songsToAdd {
+			// Check for duplicates.
 			if b.nowPlayingID == song.ID {
-				continue
+				continue // Skip currently playing song
 			}
 			isDuplicateInQueue := false
 			for _, queuedSong := range b.songQueue {
@@ -801,11 +603,14 @@ func (b *Bot) handleAdd(message twitch.PrivateMessage) {
 				}
 			}
 			if isDuplicateInQueue {
-				continue
+				continue // Skip song already in queue
 			}
+
+			// Add the song.
 			b.songQueue = append(b.songQueue, song)
 			addedCount++
 		}
+
 		if len(songsToAdd) == 1 && addedCount == 1 {
 			b.twitchClient.Say(b.config.Channel, fmt.Sprintf(`Song "%s" added! Position: %d`, songsToAdd[0].Title, len(b.songQueue)))
 		} else if addedCount > 0 {
@@ -843,6 +648,8 @@ func (b *Bot) handleSkip(message twitch.PrivateMessage) {
 	if b.playerCmd != nil && b.playerCmd.Process != nil {
 		log.Println("[PLAYER] Skip requested. Terminating current song...")
 		b.playerCmd.Process.Kill()
+	} else {
+		log.Println("[PLAYER] Skip requested, but nothing is playing.")
 	}
 }
 
@@ -864,32 +671,42 @@ func (b *Bot) handleFemboy(message twitch.PrivateMessage) {
 }
 
 // --- Music & Player Logic ---
-
+// ... (This section is unchanged, so I'll omit it for brevity) ...
 func (b *Bot) downloaderLoop() {
 	for {
 		var songToDownload *Song
 		b.queueMutex.Lock()
 		for i := range b.songQueue {
+			// Find the first song in the queue that hasn't been downloaded yet.
 			if b.songQueue[i].FilePath == "" {
 				songToDownload = &b.songQueue[i]
 				break
 			}
 		}
 		b.queueMutex.Unlock()
+
 		if songToDownload != nil {
 			log.Printf("[DOWNLOADER] Attempting to download: \"%s\"", songToDownload.Title)
 			filenameTemplate := filepath.Join(b.downloadDir, "%(id)s.%(ext)s")
+
+			// Create a context with a 2-minute timeout.
 			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-			downloadCmd := exec.CommandContext(ctx, "nice", "-n", "19", "yt-dlp", "-f", "bestaudio", "-o", filenameTemplate, songToDownload.ID)
+			downloadCmd := exec.CommandContext(ctx, "nice", "-n", "19", "yt-dlp", "-f", "bestaudio", "-o", filenameTemplate, songToDownload.URL)
+
+			// Run the download command.
 			err := downloadCmd.Run()
-			cancel()
+			cancel() // Always call cancel to release the context resources.
+
 			if err != nil {
+				// If an error occurs, remove the song from the queue.
 				log.Printf("[ERROR] Failed to download \"%s\": %v", songToDownload.Title, err)
 				if ctx.Err() == context.DeadlineExceeded {
 					b.twitchClient.Say(b.config.Channel, fmt.Sprintf("Error: Download for '%s' took longer than 2 minutes and was cancelled.", songToDownload.Title))
 				} else {
 					b.twitchClient.Say(b.config.Channel, fmt.Sprintf("Error: Could not download '%s'.", songToDownload.Title))
 				}
+
+				// Remove the failed song from the queue.
 				b.queueMutex.Lock()
 				newQueue := make([]Song, 0, len(b.songQueue))
 				for _, song := range b.songQueue {
@@ -900,23 +717,18 @@ func (b *Bot) downloaderLoop() {
 				b.songQueue = newQueue
 				b.queueMutex.Unlock()
 			} else {
-				getFilenameCmd := exec.Command("yt-dlp", "--get-filename", "-f", "bestaudio", "-o", filenameTemplate, songToDownload.ID)
+				// If download is successful, get the exact filename.
+				getFilenameCmd := exec.Command("yt-dlp", "--get-filename", "-f", "bestaudio", "-o", filenameTemplate, songToDownload.URL)
 				output, err := getFilenameCmd.Output()
 				if err != nil {
-					log.Printf("[ERROR] Could not determine filename for \"%s\" after download: %v. Removing from queue.", songToDownload.Title, err)
-					b.twitchClient.Say(b.config.Channel, fmt.Sprintf("Error processing '%s' after download.", songToDownload.Title))
-					b.queueMutex.Lock()
-					newQueue := make([]Song, 0, len(b.songQueue))
-					for _, song := range b.songQueue {
-						if song.ID != songToDownload.ID {
-							newQueue = append(newQueue, song)
-						}
-					}
-					b.songQueue = newQueue
-					b.queueMutex.Unlock()
+					log.Printf("[ERROR] Could not determine filename for \"%s\" after download: %v", songToDownload.Title, err)
+					// Even if we can't get the filename, the file is downloaded, but we can't play it.
+					// It will be cleaned up later by the cleanupLoop.
 				} else {
 					actualFilename := strings.TrimSpace(string(output))
 					log.Printf("[DOWNLOADER] Finished download for: \"%s\" -> %s", songToDownload.Title, actualFilename)
+
+					// Update the song in the queue with its new file path.
 					b.queueMutex.Lock()
 					for i := range b.songQueue {
 						if b.songQueue[i].ID == songToDownload.ID {
@@ -931,32 +743,27 @@ func (b *Bot) downloaderLoop() {
 		time.Sleep(2 * time.Second)
 	}
 }
-
 func (b *Bot) playerLoop() {
 	for {
 		var songToPlay *Song
 		b.queueMutex.Lock()
+		// Play a song if nothing is currently playing and the first song in the queue is downloaded.
 		if b.playerCmd == nil && len(b.songQueue) > 0 && b.songQueue[0].FilePath != "" {
 			songToPlay = &b.songQueue[0]
 			b.nowPlayingID = songToPlay.ID
 			b.songQueue = b.songQueue[1:]
 		}
 		b.queueMutex.Unlock()
+
 		if songToPlay != nil {
 			log.Printf("[PLAYER] Found ready song to play: \"%s\"", songToPlay.Title)
-			payload := NowPlayingPayload{Title: songToPlay.Title}
-			msg, _ := json.Marshal(WebSocketMessage{Type: "now_playing", Payload: payload})
-			b.hub.broadcast <- msg
 			b.playFile(*songToPlay)
+			// Clear the nowPlayingID after the song finishes.
 			b.nowPlayingID = ""
-			payload = NowPlayingPayload{Title: "Nothing playing..."}
-			msg, _ = json.Marshal(WebSocketMessage{Type: "now_playing", Payload: payload})
-			b.hub.broadcast <- msg
 		}
 		time.Sleep(1 * time.Second)
 	}
 }
-
 func (b *Bot) playFile(song Song) {
 	log.Printf("▶️ Now Playing: \"%s\"", song.Title)
 	b.twitchClient.Say(b.config.Channel, fmt.Sprintf("Now playing: %s", song.Title))
@@ -972,7 +779,6 @@ func (b *Bot) playFile(song Song) {
 	b.queueMutex.Unlock()
 	log.Printf("⏹️ Finished Playing: \"%s\"", song.Title)
 }
-
 func (b *Bot) cleanupLoop() {
 	ticker := time.NewTicker(b.cleanupInterval)
 	defer ticker.Stop()
@@ -1009,15 +815,19 @@ func (b *Bot) endBlackjackGame(message twitch.PrivateMessage, resultMessage stri
 	defer b.blackjackMutex.Unlock()
 	b.chipsMutex.Lock()
 	defer b.chipsMutex.Unlock()
+
+	// Only modify chips and send a message if there's a result to report.
+	// This prevents duplicate messages when called from handleHit for a bust.
 	if resultMessage != "" {
 		b.userChips[username] += payout
 		finalMsg := fmt.Sprintf("%s, %s Your new balance is %d.", message.User.DisplayName, resultMessage, b.userChips[username])
 		b.twitchClient.Say(b.config.Channel, finalMsg)
-	} else if payout == 0 {
-		b.userChips[username] += 0
+	} else if payout == 0 { // This is a bust scenario
+		b.userChips[username] += 0 // Payout is 0 on a bust, chips are already deducted.
 		finalMsg := fmt.Sprintf("Your new balance is %d.", b.userChips[username])
 		b.twitchClient.Say(b.config.Channel, fmt.Sprintf("%s, %s", message.User.DisplayName, finalMsg))
 	}
+
 	delete(b.blackjackGames, username)
 }
 
@@ -1128,16 +938,23 @@ type YTDLPInfo struct {
 }
 
 func getYoutubeInfo(query string) (*YTDLPInfo, error) {
+	// Note: The caller is now responsible for specifying "ytsearch:" for searches.
 	cmd := exec.Command("yt-dlp", "--quiet", "--dump-single-json", query)
 	output, err := cmd.Output()
 	if err != nil {
+		// This can happen if yt-dlp fails to find a video or another network error occurs.
 		return nil, fmt.Errorf("could not find a video for that request")
 	}
+
 	var info YTDLPInfo
 	if err := json.Unmarshal(output, &info); err != nil {
 		return nil, fmt.Errorf("failed to parse video data from yt-dlp: %w", err)
 	}
+
+	// If it's a playlist, yt-dlp returns a _type of "playlist".
+	// We will not validate individual songs in a playlist to avoid long delays.
 	if info.Type == "playlist" {
+		// Populate URLs for playlist entries if they are missing
 		for i := range info.Entries {
 			if info.Entries[i].URL == "" {
 				info.Entries[i].URL = fmt.Sprintf("https://www.youtube.com/watch?v=%s", info.Entries[i].ID)
@@ -1145,17 +962,23 @@ func getYoutubeInfo(query string) (*YTDLPInfo, error) {
 		}
 		return &info, nil
 	}
+
+	// For single videos, perform the validation checks.
 	if info.IsLive {
 		return nil, fmt.Errorf("cannot add live videos")
 	}
 	if info.Duration > maxSongDuration {
 		return nil, fmt.Errorf("video is longer than 15 minutes")
 	}
+
+	// Ensure the URL is populated for single videos.
 	if info.URL == "" && info.ID != "" {
 		info.URL = fmt.Sprintf("https://www.youtube.com/watch?v=%s", info.ID)
 	}
+
 	return &info, nil
 }
+
 
 // --- Gemini API ---
 
@@ -1198,29 +1021,37 @@ func (b *Bot) getGeminiTextResponse(prompt string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("failed to create Gemini request: %w", err)
 	}
+
 	url := "https://generativelanguage.googleapis.com/v1beta/models/" + b.config.GeminiModel + ":generateContent?key=" + b.config.GeminiAPIKey
+
 	req, err := http.NewRequest("POST", url, bytes.NewBuffer(requestBody))
 	if err != nil {
 		return "", fmt.Errorf("failed to create http request: %w", err)
 	}
+
 	req.Header.Set("Content-Type", "application/json")
+
 	client := &http.Client{Timeout: 30 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("failed to send request to Gemini: %w", err)
 	}
 	defer resp.Body.Close()
+
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
 		return "", fmt.Errorf("Gemini API returned non-200 status code: %d %s", resp.StatusCode, string(body))
 	}
+
 	var geminiResponse GeminiResponse
 	if err := json.NewDecoder(resp.Body).Decode(&geminiResponse); err != nil {
 		return "", fmt.Errorf("failed to decode Gemini response: %w", err)
 	}
+
 	if len(geminiResponse.Candidates) > 0 && len(geminiResponse.Candidates[0].Content.Parts) > 0 {
 		return geminiResponse.Candidates[0].Content.Parts[0].Text, nil
 	}
+
 	return "Sorry, I couldn't come up with a response.", nil
 }
 
@@ -1242,11 +1073,11 @@ func loadConfig(path string) (*Config, error) {
 		return nil, fmt.Errorf("failed to read config file: %w", err)
 	}
 	return &Config{
-		BotUsername:  file.Section("Twitch").Key("bot_username").String(),
-		Channel:      file.Section("Twitch").Key("channel").String(),
-		OAuthToken:   file.Section("Twitch").Key("oauth_token").String(),
+		BotUsername: file.Section("Twitch").Key("bot_username").String(),
+		Channel:     file.Section("Twitch").Key("channel").String(),
+		OAuthToken:  file.Section("Twitch").Key("oauth_token").String(),
 		GeminiAPIKey: file.Section("Gemini").Key("api_key").String(),
-		GeminiModel:  file.Section("Gemini").Key("model").String(),
+		GeminiModel: file.Section("Gemini").Key("model").String(),
 	}, nil
 }
 
