@@ -23,7 +23,6 @@ import (
 
 	"github.com/gempir/go-twitch-irc/v4"
 	"github.com/gorilla/websocket"
-	hook "github.com/robotn/gohook"
 	"gopkg.in/ini.v1"
 )
 
@@ -220,7 +219,6 @@ type Bot struct {
 	freeChipsAmount   int64
 	blackjackMutex    sync.Mutex
 	blackjackGames    map[string]*BlackjackGame
-	isPlayerPaused    bool
 	ttsEnabled        bool
 	ttsMutex          sync.Mutex
 	ttsPlaybackMutex  sync.Mutex
@@ -297,7 +295,6 @@ func main() {
 	go bot.cleanupLoop()
 	go bot.periodicSaveLoop()
 	go startWebServer(bot.hub)
-	go startHotkeyListener(bot)
 
 	bot.twitchClient = twitch.NewClient(cfg.BotUsername, cfg.OAuthToken)
 	bot.twitchClient.OnPrivateMessage(bot.handleTwitchMessage)
@@ -404,59 +401,6 @@ func startWebServer(hub *Hub) {
 	log.Println("[INFO] Starting web server on :8080")
 	if err := http.ListenAndServe(":8080", nil); err != nil {
 		log.Fatalf("[FATAL] ListenAndServe: %v", err)
-	}
-}
-
-// --- Hotkey Logic ---
-
-func (b *Bot) handlePauseToggle() {
-	b.queueMutex.Lock()
-	defer b.queueMutex.Unlock()
-
-	if b.playerCmd == nil || b.playerCmd.Process == nil {
-		log.Println("[HOTKEY] Pause/Play pressed, but nothing is playing.")
-		return
-	}
-
-	if b.isPlayerPaused {
-		log.Println("[HOTKEY] Resuming playback.")
-		err := b.playerCmd.Process.Signal(syscall.SIGCONT)
-		if err != nil {
-			log.Printf("[ERROR] Failed to send SIGCONT signal: %v", err)
-		} else {
-			b.isPlayerPaused = false
-		}
-	} else {
-		log.Println("[HOTkey] Pausing playback.")
-		err := b.playerCmd.Process.Signal(syscall.SIGSTOP)
-		if err != nil {
-			log.Printf("[ERROR] Failed to send SIGSTOP signal: %v", err)
-		} else {
-			b.isPlayerPaused = true
-		}
-	}
-}
-
-func startHotkeyListener(b *Bot) {
-	log.Println("[INFO] Initializing global hotkey listener...")
-
-	evChan := hook.Start()
-	defer hook.End()
-
-	for ev := range evChan {
-		if ev.Kind == hook.KeyDown {
-			switch ev.Rawcode {
-			case 176: // Media Next Track
-				log.Println("[HOTKEY] Skip pressed.")
-				mockMessage := twitch.PrivateMessage{
-					User: twitch.User{DisplayName: "Hotkey"},
-				}
-				b.handleSkip(mockMessage)
-
-			case 179: // Media Play/Pause
-				b.handlePauseToggle()
-			}
-		}
 	}
 }
 
@@ -899,9 +843,6 @@ func (b *Bot) handleSkip(message twitch.PrivateMessage) {
 	if b.playerCmd != nil && b.playerCmd.Process != nil {
 		log.Println("[PLAYER] Skip requested. Terminating current song...")
 		b.playerCmd.Process.Kill()
-		b.isPlayerPaused = false
-	} else {
-		log.Println("[PLAYER] Skip requested, but nothing is playing.")
 	}
 }
 
@@ -1028,7 +969,6 @@ func (b *Bot) playFile(song Song) {
 	playerCmd.Run()
 	b.queueMutex.Lock()
 	b.playerCmd = nil
-	b.isPlayerPaused = false
 	b.queueMutex.Unlock()
 	log.Printf("⏹️ Finished Playing: \"%s\"", song.Title)
 }
